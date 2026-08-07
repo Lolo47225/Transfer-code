@@ -1,0 +1,625 @@
+#!/bin/bash
+#SBATCH --job-name=af3_complex
+#SBATCH --output=af3_complex_%j.out
+#SBATCH --error=af3_complex_%j.err
+#SBATCH --time=48:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:l40s:3
+#SBATCH --partition=gpu
+#SBATCH --mem=128G
+#SBATCH --cpus-per-task=16
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=gpsl0084@leeds.ac.uk
+#SBATCH --signal=B:USR1@120
+
+# set -e active only during setup.  Disabled before GPU loops so that
+# individual prediction failures do not abort the whole job.
+set -e
+
+_resubmit_handler() {
+    echo ""
+    echo "--- TIMEOUT WARNING: 2 minutes remaining ---"
+    echo "--- Triggering auto resubmit ---"
+    if [ -f "$complex_jobs_list" ]; then
+        total_complex=$(wc -l < "$complex_jobs_list")
+        complex_passed=$(( $(find "$af3_complex_dir" -name "*sample-0*_summary_confidences.json" | wc -l || true) / 4 ))
+        remaining=$(( total_complex - complex_passed ))
+        if [ "$remaining" -gt 0 ]; then
+            sbatch \
+                --export=AF3_INPUT_DIR="$AF3_INPUT_DIR",AF3_OUTPUT_DIR="$AF3_OUTPUT_DIR",AF3_SIF="$AF3_SIF",AF3_MODELS="$AF3_MODELS",AF3_DB="$AF3_DB",APPTAINER="$APPTAINER" \
+                "$0"
+            echo "  Resubmitted: $remaining jobs remaining"
+        fi
+    fi
+    exit 0
+}
+trap '_resubmit_handler' USR1
+
+# =============================================================================
+# ALL PATHS passed in via --export from Job 1 — do not edit here
+# Expected variables:
+#   AF3_INPUT_DIR, AF3_OUTPUT_DIR, AF3_SIF, AF3_MODELS, AF3_DB, APPTAINER
+# =============================================================================
+
+for var in AF3_INPUT_DIR AF3_OUTPUT_DIR AF3_SIF AF3_MODELS AF3_DB APPTAINER; do
+    if [ -z "${!var}" ]; then
+        echo "ERROR: required variable $var was not passed from Job 1" >&2
+        exit 1
+    fi
+done
+
+af3_complex_dir="$AF3_OUTPUT_DIR/complex"
+af3_logs="$AF3_OUTPUT_DIR/logs"
+af3_msa_cache="$AF3_OUTPUT_DIR/msa_cache"
+af3_summary="$AF3_OUTPUT_DIR/af3_summary.csv"
+IPSAE_SCRIPT="/mnt/scratch/gpsl0084/IPSAE/ipsae.py"
+IPSAE_OUT_DIR="$AF3_OUTPUT_DIR/ipsae"
+PAE_CUTOFF=10
+DIST_CUTOFF=10
+
+mkdir -p "$af3_complex_dir" "$af3_logs" "$af3_msa_cache" "$IPSAE_OUT_DIR"
+
+complex_jobs_list="$AF3_INPUT_DIR/complex_jobs.txt"
+if [ ! -f "$complex_jobs_list" ]; then
+    echo "ERROR: complex_jobs.txt not found at $complex_jobs_list" >&2
+    exit 1
+fi
+
+n_jobs=$(grep -c . "$complex_jobs_list" || true)
+
+echo "======================================================================"
+echo " Job 2 — AF3 Complex Predictions + ipSAE Scoring"
+echo " Started  : $(date)"
+echo " Jobs     : $n_jobs complex predictions"
+echo " GPUs     : $(nvidia-smi --query-gpu=name --format=csv,noheader | tr '\n' ',' | sed 's/,$//')"
+echo "======================================================================"
+
+# =============================================================================
+# STEP 1 — Run KRAS MSA data pipeline ONCE and cache the result
+# =============================================================================
+echo ""
+echo "--- STEP 1: Running KRAS MSA data pipeline (once, then cached) ---"
+
+first_job=$(head -1 "$complex_jobs_list")
+first_job_name=$(basename "$first_job" .json)
+first_job_basename=$(basename "$first_job")
+msa_seed_dir="$af3_msa_cache/$first_job_name"
+cached_job_dir="$af3_msa_cache/$first_job_name"
+mkdir -p "$msa_seed_dir"
+
+if [ -d "$cached_job_dir" ] && [ "$(ls -A "$cached_job_dir" 2>/dev/null)" ]; then
+    echo "  MSA cache already exists — skipping data pipeline"
+    USE_CACHE=true
+else
+    echo "  Running data pipeline on: $first_job_name"
+    mkdir -p /tmp/af3_msa_tmp
+
+    CUDA_VISIBLE_DEVICES="" \
+    "$APPTAINER" exec \
+        --nv \
+        --bind "$AF3_INPUT_DIR":/root/af_input \
+        --bind "$af3_msa_cache":/root/af_output \
+        --bind "$AF3_DB":/root/public_databases \
+        --bind "$AF3_MODELS":/root/models \
+        --bind "/tmp/af3_msa_tmp":/tmp \
+        "$AF3_SIF" \
+        /bin/bash -c "cd /app/alphafold && /alphafold3_venv/bin/python run_alphafold.py \
+            --json_path=/root/af_input/${first_job_basename} \
+            --model_dir=/root/models \
+            --db_dir=/root/public_databases \
+            --output_dir=/root/af_output \
+            --jackhmmer_n_cpu=3 \
+            --nhmmer_n_cpu=3 \
+            --run_data_pipeline=true \
+            --run_inference=false \
+            --force_output_dir=true" \
+        > "$af3_logs/${first_job_name}_msa.log" 2>&1
+
+    echo "  MSA pipeline complete."
+
+    if [ -d "$cached_job_dir" ] && [ "$(ls -A "$cached_job_dir" 2>/dev/null)" ]; then
+        echo "  Cached features found at: $cached_job_dir"
+        USE_CACHE=true
+    else
+        echo "  WARNING: cached features directory is missing or empty"
+        USE_CACHE=false
+    fi
+fi
+
+export USE_CACHE cached_job_dir af3_msa_cache first_job_name
+
+# =============================================================================
+# STEP 2 — Run AF3 inference across all 3 GPUs
+# =============================================================================
+set +e
+
+echo ""
+echo "--- STEP 2: Running AF3 complex inference (3 x L40S GPUs) ---"
+
+run_af3_complex_job() {
+    local json_file="$1"
+    local gpu_id="$2"
+    local job_name
+    job_name=$(basename "$json_file" .json)
+    local json_basename
+    json_basename=$(basename "$json_file")
+    local log_file="$af3_logs/${job_name}.log"
+    
+    echo "  [GPU $gpu_id] Starting: $job_name"
+
+    # Skip if already completed
+    if find "$af3_complex_dir/$job_name" -name "*sample-0*_summary_confidences.json" 2>/dev/null | grep -q .; then
+        echo "  [GPU $gpu_id] Skipping (already complete): $job_name"
+        return 0
+    fi
+
+    local apptainer_tmp="/tmp/apptainer_complex_gpu${gpu_id}_$$"
+    mkdir -p "$apptainer_tmp/tmp" "$apptainer_tmp/cache" "$apptainer_tmp/run"
+    mkdir -p "$apptainer_tmp/container_tmp"
+
+
+    APPTAINER_TMPDIR="$apptainer_tmp/tmp" \
+    APPTAINER_CACHEDIR="$apptainer_tmp/cache" \
+    APPTAINER_RUNDIR="$apptainer_tmp/run" \
+    CUDA_VISIBLE_DEVICES="$gpu_id" \
+    "$APPTAINER" exec \
+        --nv \
+        --bind "$AF3_INPUT_DIR":/root/af_input \
+        --bind "$af3_complex_dir":/root/af_output \
+        --bind "$AF3_DB":/root/public_databases \
+        --bind "$AF3_MODELS":/root/models \
+        --bind "$apptainer_tmp/container_tmp":/tmp \
+        "$AF3_SIF" \
+        /bin/bash -c "cd /app/alphafold && /alphafold3_venv/bin/python run_alphafold.py \
+            --json_path=/root/af_input/${json_basename} \
+            --model_dir=/root/models \
+            --db_dir=/root/public_databases \
+            --output_dir=/root/af_output \
+            --gpu_device=0 \
+            --jackhmmer_n_cpu=4 \
+            --nhmmer_n_cpu=4 \
+            --run_data_pipeline=true \
+            --run_inference=true \
+            --force_output_dir=true" \
+        > "$log_file" 2>&1
+
+    local rc=$?
+    rm -rf "$apptainer_tmp"
+
+    if [ $rc -eq 0 ]; then
+        echo "  [GPU $gpu_id] Done   : $job_name"
+    else
+        echo "  [GPU $gpu_id] FAILED : $job_name (rc=$rc) — see $log_file"
+        echo "  --- Last 20 lines of $log_file ---"
+        tail -20 "$log_file"
+        echo "  ---"
+    fi
+    return 0
+}
+
+export -f run_af3_complex_job
+
+export af3_logs AF3_INPUT_DIR af3_complex_dir AF3_DB AF3_MODELS AF3_SIF APPTAINER
+export USE_CACHE cached_job_dir af3_msa_cache first_job_name
+
+echo "--- Checking complex_jobs.txt ---"
+echo "Total jobs: $(wc -l < "$complex_jobs_list")"
+head -3 "$complex_jobs_list"
+
+# GPU 0 — jobs 0, 3, 6, 9 ...
+(
+    idx=0
+    while IFS= read -r json_file; do
+        [ -z "$json_file" ] && { (( idx++ )) || true; continue; }
+        if (( idx % 3 == 0 )); then run_af3_complex_job "$json_file" 0; fi
+        (( idx++ )) || true
+    done < "$complex_jobs_list"
+) &
+GPU0_PID=$!
+
+# GPU 1 — jobs 1, 4, 7, 10 ...
+(
+    idx=0
+    while IFS= read -r json_file; do
+        [ -z "$json_file" ] && { (( idx++ )) || true; continue; }
+        if (( idx % 3 == 1 )); then run_af3_complex_job "$json_file" 1; fi
+        (( idx++ )) || true
+    done < "$complex_jobs_list"
+) &
+GPU1_PID=$!
+
+# GPU 2 — jobs 2, 5, 8, 11 ...
+(
+    idx=0
+    while IFS= read -r json_file; do
+        [ -z "$json_file" ] && { (( idx++ )) || true; continue; }
+        if (( idx % 3 == 2 )); then run_af3_complex_job "$json_file" 2; fi
+        (( idx++ )) || true
+    done < "$complex_jobs_list"
+) &
+GPU2_PID=$!
+
+echo "  Waiting for all complex GPU queues to finish..."
+wait $GPU0_PID
+wait $GPU1_PID
+wait $GPU2_PID
+
+echo "All complex predictions complete."
+
+# =============================================================================
+# STEP 3 — Run ipSAE scoring on all complex predictions
+# =============================================================================
+echo ""
+echo "--- STEP 3: Running ipSAE scoring ---"
+
+source ~/miniconda3/bin/activate mlfold || {
+    echo "ERROR: could not activate conda environment 'mlfold'" >&2
+    exit 1
+}
+
+n_scored=0
+n_failed=0
+
+for job_subdir in "$af3_complex_dir"/*/; do
+    [ -d "$job_subdir" ] || continue
+    job_name=$(basename "$job_subdir")
+
+    ipsae_out="$IPSAE_OUT_DIR/${job_name}_ipsae.txt"
+
+    # Skip if already scored
+    if [ -f "$ipsae_out" ] && [ -s "$ipsae_out" ]; then
+        echo "  ipSAE already scored: $job_name"
+        (( n_scored++ )) || true
+        continue
+    fi
+
+    # Find all sample CIF files across all seeds
+    sample_count=0
+    scored_count=0
+
+    # Score top level model first
+    pae_json=$(find "$job_subdir" -maxdepth 1 -name "*_confidences.json" -not -name "*summary*" | head -1)
+    cif_file=$(find "$job_subdir" -maxdepth 1 -name "*_model.cif" | head -1)
+
+    if [ -z "$pae_json" ] || [ -z "$cif_file" ]; then
+        echo "  WARNING: missing AF3 outputs for $job_name — skipping ipSAE"
+        (( n_failed++ )) || true
+        continue
+    fi
+
+    # Run ipSAE on each seed/sample directory
+    for sample_dir in "$job_subdir"seed-*/; do
+        [ -d "$sample_dir" ] || continue
+        sample_pae=$(find "$sample_dir" -maxdepth 1 -name "*_confidences.json" -not -name "*summary*" | head -1)
+        sample_cif=$(find "$sample_dir" -maxdepth 1 -name "*_model.cif" | head -1)
+
+        [ -z "$sample_pae" ] || [ -z "$sample_cif" ] && continue
+
+        (( sample_count++ )) || true
+
+        python "$IPSAE_SCRIPT" \
+            "$sample_pae" \
+            "$sample_cif" \
+            "$PAE_CUTOFF" \
+            "$DIST_CUTOFF" \
+            2>>"$IPSAE_OUT_DIR/${job_name}_ipsae.err"
+
+        ipsae_written=$(find "$(dirname "$sample_cif")" -name "*_${PAE_CUTOFF}_${DIST_CUTOFF}.txt" -not -name "*byres*" | head -1)
+        if [ -n "$ipsae_written" ]; then
+            cat "$ipsae_written" >> "$IPSAE_OUT_DIR/${job_name}_all_samples.txt"
+            (( scored_count++ )) || true
+        fi
+    done
+
+    echo "  Scored $scored_count/$sample_count samples for $job_name"
+
+    if [ "$scored_count" -gt 0 ]; then
+        (( n_scored++ )) || true
+        # Mark as complete by creating the ipsae_out file
+        echo "Scored $scored_count samples" > "$ipsae_out"
+    else
+        echo "  WARNING: ipSAE produced no output for $job_name"
+        (( n_failed++ )) || true
+    fi
+done
+
+echo "  ipSAE complete: $n_scored scored, $n_failed failed/skipped"
+conda deactivate
+
+# =============================================================================
+# STEP 4 — Collate all scores into ranked summary CSV
+# =============================================================================
+echo ""
+echo "--- STEP 4: Collating all scores into ranked summary CSV ---"
+
+export AF3_APO_DIR="$AF3_OUTPUT_DIR/apo"
+export AF3_COMPLEX_DIR="$af3_complex_dir"
+export AF3_SUMMARY="$af3_summary"
+export IPSAE_OUT_DIR="$IPSAE_OUT_DIR"
+export AF3_INPUT_DIR="$AF3_INPUT_DIR"
+
+source ~/miniconda3/bin/activate mlfold
+
+python3 - << 'PYEOF'
+import os, glob, json, csv, re
+
+apo_dir     = os.environ["AF3_APO_DIR"]
+complex_dir = os.environ["AF3_COMPLEX_DIR"]
+summary_out = os.environ["AF3_SUMMARY"]
+ipsae_dir   = os.environ["IPSAE_OUT_DIR"]
+af3_input_dir = os.environ["AF3_INPUT_DIR"]
+
+def get_sequences(af3_input_dir):
+    sequences = {}
+    for json_file in sorted(glob.glob(os.path.join(af3_input_dir, "*_complex.json"))):
+        job_name = os.path.splitext(os.path.basename(json_file))[0]
+        base = re.sub(r"_complex$", "", job_name)
+        try:
+            with open(json_file) as f:
+                data = json.load(f)
+            for seq_entry in data.get("sequences", []):
+                protein = seq_entry.get("protein", {})
+                if protein.get("id") == "B":
+                    sequences[base] = protein.get("sequence", "NA")
+                    break
+        except Exception as e:
+            print(f"  WARNING: could not read sequence for {base}: {e}")
+    return sequences
+
+def parse_af3_scores(results_dir):
+    scores = {}
+    for subdir in sorted(glob.glob(os.path.join(results_dir, "*"))):
+        if not os.path.isdir(subdir):
+            continue
+        job_name = os.path.basename(subdir)
+
+        collected = {
+            "ptm": [], "iptm": [], "ranking_score": [], "fraction_disordered": []
+        }
+
+        # Search all seed/sample subdirectories for per-sample confidences
+        sample_files = glob.glob(
+            os.path.join(subdir, "seed-*", "*_summary_confidences.json")
+        )
+
+        for sample_file in sorted(sample_files):
+            try:
+                with open(sample_file) as f:
+                    data = json.load(f)
+                for key in collected:
+                    val = data.get(key)
+                    if val is not None:
+                        try:
+                            collected[key].append(float(val))
+                        except (ValueError, TypeError):
+                            pass
+            except Exception as e:
+                print(f"  WARNING: could not read {sample_file}: {e}")
+
+        if collected["ptm"]:
+            n = len(collected["ptm"])
+            scores[job_name] = {
+                "ptm":                 f"{sum(collected['ptm'])/n:.6f}",
+                "iptm":                f"{sum(collected['iptm'])/n:.6f}" if collected["iptm"] else "NA",
+                "ranking_score":       f"{sum(collected['ranking_score'])/n:.6f}" if collected["ranking_score"] else "NA",
+                "fraction_disordered": f"{sum(collected['fraction_disordered'])/n:.6f}" if collected["fraction_disordered"] else "NA",
+                "n_af3_samples":       str(n),
+            }
+        else:
+            # Fall back to top level summary_confidences.json if no per-sample files found
+            conf_path = os.path.join(subdir, "summary_confidences.json")
+            if not os.path.exists(conf_path):
+                candidates = glob.glob(
+                    os.path.join(subdir, "**", "*_summary_confidences.json"),
+                    recursive=True
+                )
+                conf_path = candidates[0] if candidates else None
+            if conf_path and os.path.exists(conf_path):
+                with open(conf_path) as f:
+                    data = json.load(f)
+                scores[job_name] = {
+                    "ptm":                 data.get("ptm",                 "NA"),
+                    "iptm":                data.get("iptm",                "NA"),
+                    "ranking_score":       data.get("ranking_score",       "NA"),
+                    "fraction_disordered": data.get("fraction_disordered", "NA"),
+                    "n_af3_samples":       "1",
+                }
+            else:
+                print(f"  WARNING: no summary_confidences.json for {job_name}")
+    return scores
+
+def parse_ipsae_scores(ipsae_dir):
+    scores = {}
+    for all_samples_file in sorted(glob.glob(os.path.join(ipsae_dir, "*_all_samples.txt"))):
+        job_name = os.path.basename(all_samples_file).replace("_all_samples.txt", "")
+        
+        collected = {
+            "ipsae": [], "ipsae_d0chn": [], "ipsae_d0dom": [],
+            "iptm_af": [], "pdockq": [], "pdockq2": [], "lis": []
+        }
+        
+        try:
+            with open(all_samples_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("Chn1"):
+                        continue
+                    parts = line.split()
+                    if len(parts) < 13:
+                        continue
+                    chn1     = parts[0]
+                    chn2     = parts[1]
+                    row_type = parts[4]
+                    if chn1 == "A" and chn2 == "B" and row_type == "max":
+                        try:
+                            collected["ipsae"].append(float(parts[5]))
+                            collected["ipsae_d0chn"].append(float(parts[6]))
+                            collected["ipsae_d0dom"].append(float(parts[7]))
+                            collected["iptm_af"].append(float(parts[8]))
+                            collected["pdockq"].append(float(parts[10]))
+                            collected["pdockq2"].append(float(parts[11]))
+                            collected["lis"].append(float(parts[12]))
+                        except (ValueError, IndexError):
+                            continue
+        except Exception as e:
+            print(f"  WARNING: could not parse {all_samples_file}: {e}")
+
+        if collected["ipsae"]:
+            n = len(collected["ipsae"])
+            scores[job_name] = {
+                "ipsae":       f"{sum(collected['ipsae'])/n:.6f}",
+                "ipsae_d0chn": f"{sum(collected['ipsae_d0chn'])/n:.6f}",
+                "ipsae_d0dom": f"{sum(collected['ipsae_d0dom'])/n:.6f}",
+                "iptm_af":     f"{sum(collected['iptm_af'])/n:.6f}",
+                "pdockq":      f"{sum(collected['pdockq'])/n:.6f}",
+                "pdockq2":     f"{sum(collected['pdockq2'])/n:.6f}",
+                "lis":         f"{sum(collected['lis'])/n:.6f}",
+                "n_samples":   str(n),
+            }
+            print(f"  {job_name}: averaged {n} samples, mean ipSAE = {scores[job_name]['ipsae']}")
+        else:
+            scores[job_name] = {
+                "ipsae": "NA", "ipsae_d0chn": "NA", "ipsae_d0dom": "NA",
+                "iptm_af": "NA", "pdockq": "NA", "pdockq2": "NA",
+                "lis": "NA", "n_samples": "0"
+            }
+    return scores
+
+sequences      = get_sequences(af3_input_dir)
+apo_scores     = parse_af3_scores(apo_dir)
+complex_scores = parse_af3_scores(complex_dir)
+ipsae_scores   = parse_ipsae_scores(ipsae_dir)
+
+print(f"  Sequences found     : {len(sequences)}")
+print(f"  Apo scores found    : {len(apo_scores)}")
+print(f"  Complex scores found: {len(complex_scores)}")
+print(f"  ipSAE scores found  : {len(ipsae_scores)}")
+
+all_bases = set()
+for k in apo_scores:
+    all_bases.add(re.sub(r"_apo$", "", k))
+for k in complex_scores:
+    all_bases.add(re.sub(r"_complex$", "", k))
+for k in ipsae_scores:
+    all_bases.add(k.replace("_complex", ""))
+
+print(f"  All bases           : {len(all_bases)}")
+
+rows = []
+for base in sorted(all_bases):
+    apo   = apo_scores.get(f"{base}_apo",      {})
+    comp  = complex_scores.get(f"{base}_complex", {})
+    ipsae = ipsae_scores.get(f"{base}_complex",   {})
+    rows.append({
+        "job":                     base,
+        "sequence":                sequences.get(base, "NA"),
+        "n_samples":               ipsae.get("n_samples",         "NA"),
+        "apo_ptm":                 apo.get("ptm",                 "NA"),
+        "apo_ranking_score":       apo.get("ranking_score",       "NA"),
+        "apo_frac_disordered":     apo.get("fraction_disordered", "NA"),
+        "complex_ptm":             comp.get("ptm",                "NA"),
+        "complex_iptm":            comp.get("iptm",               "NA"),
+        "complex_ranking_score":   comp.get("ranking_score",      "NA"),
+        "complex_frac_disordered": comp.get("fraction_disordered","NA"),
+        "ipsae":                   ipsae.get("ipsae",             "NA"),
+        "ipsae_d0chn":             ipsae.get("ipsae_d0chn",       "NA"),
+        "ipsae_d0dom":             ipsae.get("ipsae_d0dom",       "NA"),
+        "pdockq":                  ipsae.get("pdockq",            "NA"),
+        "pdockq2":                 ipsae.get("pdockq2",           "NA"),
+        "lis":                     ipsae.get("lis",               "NA"),
+    })
+
+def sort_key(r):
+    for field in ("ipsae", "complex_iptm", "apo_ptm"):
+        try:    return float(r[field])
+        except: pass
+    return -1.0
+
+rows.sort(key=sort_key, reverse=True)
+
+fieldnames = [
+    "job", "sequence", "n_samples",
+    "apo_ptm", "apo_ranking_score", "apo_frac_disordered",
+    "complex_ptm", "complex_iptm", "complex_ranking_score", "complex_frac_disordered",
+    "ipsae", "ipsae_d0chn", "ipsae_d0dom",
+    "pdockq", "pdockq2", "lis",
+]
+
+# Write CSV
+with open(summary_out, "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+
+# Write formatted text summary
+txt_out = summary_out.replace(".csv", "_formatted.txt")
+with open(txt_out, "w") as f:
+    f.write(f"{'='*110}\n")
+    f.write(f" CYCLICPEPTIDE BINDER RESULTS — ranked by ipSAE\n")
+    f.write(f"{'='*110}\n\n")
+    f.write(f"{'Rank':<5} {'Job':<45} {'Sequence':<15} {'ipSAE':<9} {'ipTM':<7} {'pDockQ2':<9} {'LIS':<8} {'apo_pTM':<9} {'Disordered'}\n")
+    f.write(f"{'-'*110}\n")
+    for i, r in enumerate(rows, 1):
+        f.write(
+            f"{i:<5} "
+            f"{r['job']:<45} "
+            f"{r['sequence']:<15} "
+            f"{r['ipsae']:<9} "
+            f"{r['complex_iptm']:<7} "
+            f"{r['pdockq2']:<9} "
+            f"{r['lis']:<8} "
+            f"{r['apo_ptm']:<9} "
+            f"{r['apo_frac_disordered']}\n"
+        )
+    f.write(f"\n{'='*110}\n")
+
+print(f"\nSummary CSV     : {summary_out}")
+print(f"Formatted text  : {txt_out}")
+print(f"Total entries   : {len(rows)}")
+
+if rows:
+    best = rows[0]
+    print(f"\n{'='*60}")
+    print(f" TOP HIT: {best['job']}")
+    print(f" Sequence: {best['sequence']}")
+    print(f"{'='*60}")
+    print(f"  ipSAE              = {best['ipsae']}")
+    print(f"  ipSAE_d0chn        = {best['ipsae_d0chn']}")
+    print(f"  ipSAE_d0dom        = {best['ipsae_d0dom']}")
+    print(f"  pDockQ2            = {best['pdockq2']}")
+    print(f"  LIS                = {best['lis']}")
+    print(f"  complex ipTM (AF3) = {best['complex_iptm']}")
+    print(f"  complex pTM        = {best['complex_ptm']}")
+    print(f"  apo pTM            = {best['apo_ptm']}")
+    print(f"  apo frac_disordered= {best['apo_frac_disordered']}")
+    print(f"{'='*60}")
+
+    print(f"\nTop 10 hits (sorted by ipSAE):")
+    print(f"{'Rank':<5} {'Job':<45} {'Sequence':<15} {'ipSAE':<9} {'ipTM':<7} {'pDockQ2':<9} {'LIS':<8}")
+    print("-" * 100)
+    for i, r in enumerate(rows[:10], 1):
+        print(f"{i:<5} {r['job']:<45} {r['sequence']:<15} {r['ipsae']:<9} {r['complex_iptm']:<7} {r['pdockq2']:<9} {r['lis']:<8}")
+PYEOF
+
+conda deactivate
+
+total_complex=$(wc -l < "$complex_jobs_list")
+complex_passed=$(( $(find "$af3_complex_dir" -name "*sample-0*_summary_confidences.json" | wc -l || true) / 4 ))
+complex_failed=$(( total_complex - complex_passed ))
+
+echo ""
+echo "======================================================================"
+echo " Job 2 complete!"
+echo " Finished              : $(date)"
+echo ""
+echo " AF3 complex structs   : $af3_complex_dir"
+echo " AF3 apo structs       : $AF3_OUTPUT_DIR/apo"
+echo " MSA cache             : $af3_msa_cache"
+echo " ipSAE raw outputs     : $IPSAE_OUT_DIR"
+echo " AF3 per-job logs      : $af3_logs"
+echo " Ranked summary CSV    : $af3_summary"
+echo " Formatted summary     : ${af3_summary/.csv/_formatted.txt}"
+echo " Complex passed        : $complex_passed"
+echo " Complex failed        : $complex_failed"
+echo "======================================================================"
