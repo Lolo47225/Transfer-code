@@ -1,0 +1,687 @@
+!/bin/bash
+#SBATCH --job-name=mpnn_apo
+#SBATCH --output=mpnn_apo_%j.out
+#SBATCH --error=mpnn_apo_%j.err
+#SBATCH --time=48:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:l40s:3
+#SBATCH --partition=gpu
+#SBATCH --mem=128G
+#SBATCH --cpus-per-task=16
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=gpsl0084@leeds.ac.uk
+#SBATCH --signal=B:USR1@120
+
+# set -e is active during setup/prep only.
+# It is disabled before the AF3 GPU loops so that a single failed
+# prediction does not abort the entire job.
+
+set -e
+
+# Signal handler for auto resubmit before timeout
+_resubmit_handler() {
+    echo ""
+    echo "--- TIMEOUT WARNING: 2 minutes remaining ---"
+    echo "--- Triggering auto resubmit ---"
+    # Count remaining jobs
+    if [ -f "$af3_input_dir/apo_jobs.txt" ]; then
+        total_apo=$(wc -l < "$af3_input_dir/apo_jobs.txt")
+        apo_passed=$(find "$af3_apo_dir" -name "*sample-0*_summary_confidences.json" | wc -l || true)
+        remaining=$(( total_apo - apo_passed ))
+        if [ "$remaining" -gt 0 ]; then
+            sbatch --export=ALL "$0"
+            echo "  Resubmitted: $remaining jobs remaining"
+        fi
+    fi
+    exit 0
+}
+trap '_resubmit_handler' USR1
+
+# =============================================================================
+# INPUT / OUTPUT — ONLY EDIT THESE TWO LINES PER RUN
+# =============================================================================
+
+folder_with_pdbs="/mnt/scratch/gpsl0084/RFdiffusion/scripts/outputs/kras_scaffold_k6"
+output_dir="/mnt/scratch/gpsl0084/binders/kras_binders/kras_scaffold_k6"
+
+# =============================================================================
+# FIXED PATHS — edit only if you move installations
+# =============================================================================
+
+APPTAINER="/opt/apps/pkg/tools/apptainer/1.3.6/bin/apptainer"
+AF3_SIF="/mnt/scratch/gpsl0084/alphafold3.sif"
+AF3_MODELS="/mnt/scratch/gpsl0084/AF3"
+AF3_DB="/mnt/scratch/gpsl0084/AF3/databases/databases"
+CYCLICMPNN_DIR="/mnt/scratch/gpsl0084/CyclicMPNN"
+JOB2_SCRIPT="/mnt/scratch/gpsl0084/scripts/job2_complex.slurm"
+
+# =============================================================================
+# DERIVED PATHS — do not edit
+# =============================================================================
+
+mutated_pdbs="$output_dir/mutated_pdbs"
+parsed_jsonl="$output_dir/parsed_pdbs.jsonl"
+chain_jsonl="$output_dir/chain_id.jsonl"
+fixed_jsonl="$output_dir/fixed_positions.jsonl"
+bias_by_res_jsonl="$output_dir/bias_by_res.jsonl"
+AF3_OUTPUT_DIR="$output_dir/alphafold3"
+af3_input_dir="$AF3_OUTPUT_DIR/inputs"
+af3_apo_dir="$AF3_OUTPUT_DIR/apo"
+af3_logs="$AF3_OUTPUT_DIR/logs"
+
+mkdir -p "$output_dir" "$mutated_pdbs" \
+"$af3_input_dir" "$af3_apo_dir" "$af3_logs"
+
+echo "======================================================================"
+echo " Job 1 — CyclicMPNN + AF3 Apo Predictions"
+echo " Started : $(date)"
+echo " Input   : $folder_with_pdbs"
+echo " Output  : $output_dir"
+echo " GPUs    : $(nvidia-smi --query-gpu=name --format=csv,noheader | tr '\n' ',' | sed 's/,$//')"
+echo "======================================================================"
+
+# =============================================================================
+# STEP 1 — Activate CyclicMPNN conda environment
+# =============================================================================
+
+echo ""
+echo "--- STEP 1: Activating conda environment (mlfold) ---"
+
+# Source conda init explicitly — SLURM scripts do not run .bashrc so the
+# conda shell functions are not available unless we source activate directly.
+
+source ~/miniconda3/bin/activate mlfold || {
+    echo "ERROR: could not activate conda environment 'mlfold'" >&2
+    exit 1
+}
+python -c "import numpy" 2>/dev/null || pip install numpy --quiet
+
+# =============================================================================
+# STEP 2 — Mutate first and last residue of chain B to CYS
+# =============================================================================
+
+echo ""
+echo "--- STEP 2: Mutating chain B termini to CYS ---"
+
+if [ "$(ls -A "$mutated_pdbs" 2>/dev/null)" ]; then
+    echo "  Mutated PDBs already exist — skipping mutation"
+else
+    export SRC_DIR="$folder_with_pdbs"
+    export DST_DIR="$mutated_pdbs"
+
+    python - << 'PYEOF'
+import os, glob, shutil
+
+src_dir = os.environ["SRC_DIR"]
+dst_dir = os.environ["DST_DIR"]
+
+pdbs = sorted(glob.glob(os.path.join(src_dir, "*.pdb")))
+print(f"Mutating {len(pdbs)} PDB files...")
+
+for pdb_path in pdbs:
+    fname = os.path.basename(pdb_path)
+    b_resnums = []
+    seen = set()
+    with open(pdb_path) as f:
+        for line in f:
+            if line[:4] in ("ATOM", "HETA") and line[21] == "B":
+                resnum = int(line[22:26].strip())
+                if resnum not in seen:
+                    b_resnums.append(resnum)
+                    seen.add(resnum)
+
+    if len(b_resnums) < 2:
+        print(f"  WARNING: {fname} has fewer than 2 chain B residues — skipping")
+        shutil.copy(pdb_path, os.path.join(dst_dir, fname))
+        continue
+
+    first_res, last_res = b_resnums[0], b_resnums[-1]
+    print(f"  {fname}: chain B {first_res}..{last_res} → CYS")
+
+    out_lines = []
+    with open(pdb_path) as f:
+        for line in f:
+            if line[:4] in ("ATOM", "HETA") and line[21] == "B":
+                resnum = int(line[22:26].strip())
+                if resnum in (first_res, last_res):
+                    line = line[:17] + "CYS" + line[20:]
+            out_lines.append(line)
+
+    with open(os.path.join(dst_dir, fname), "w") as fout:
+        fout.writelines(out_lines)
+
+print("Mutation complete.")
+PYEOF
+fi
+
+# =============================================================================
+# STEP 3 — Parse mutated PDBs
+# =============================================================================
+
+echo ""
+echo "--- STEP 3: Parsing mutated PDBs ---"
+
+# STEP 3 — skip if parsed jsonl already exists
+if [ -f "$parsed_jsonl" ] && [ -s "$parsed_jsonl" ]; then
+    echo "  parsed_pdbs.jsonl already exists — skipping parsing"
+else
+    python "$CYCLICMPNN_DIR/helper_scripts/parse_multiple_chains.py" \
+    --input_path="$mutated_pdbs" \
+    --output_path="$parsed_jsonl"
+fi
+
+lines=$(wc -l < "$parsed_jsonl")
+echo "Parsed $lines entries."
+if [ "$lines" -eq 0 ]; then
+    echo "ERROR: parsed_pdbs.jsonl is empty." >&2
+    exit 1
+fi
+
+# =============================================================================
+# STEP 4 — Chain assignment
+# =============================================================================
+
+echo ""
+echo "--- STEP 4: Assigning chains ---"
+
+export PARSED_JSONL="$parsed_jsonl"
+export CHAIN_JSONL="$chain_jsonl"
+
+python - << 'PYEOF'
+import json, sys, os
+
+parsed           = os.environ["PARSED_JSONL"]
+out_file         = os.environ["CHAIN_JSONL"]
+chains_to_design = ["B"]
+written = 0
+
+with open(parsed) as f_in, open(out_file, "w") as f_out:
+    for line in f_in:
+        line = line.strip()
+        if not line:
+            continue
+        entry = json.loads(line)
+        name  = entry["name"]
+        all_chains = sorted(set(
+            k.split("_chain_")[1]
+            for k in entry if k.startswith("seq_chain_")
+        ))
+        if not all_chains:
+            print(f"WARNING: no chains for {name}", file=sys.stderr)
+            continue
+        masked  = [c for c in all_chains if c in chains_to_design]
+        visible = [c for c in all_chains if c not in chains_to_design]
+        f_out.write(json.dumps({name: [masked, visible]}) + "\n")
+        written += 1
+
+print(f"Wrote chain_id.jsonl: {written} entries")
+PYEOF
+
+# =============================================================================
+# STEP 5 — Fixed positions
+# Fixes the CYS termini (set in Step 2) AND any conserved motif residues
+# carried over from the RFdiffusion scaffold. Only glycine positions
+# (the placeholders RFdiffusion left for design) remain designable.
+# =============================================================================
+
+echo ""
+echo "--- STEP 5: Setting fixed positions ---"
+
+export FIXED_JSONL="$fixed_jsonl"
+export MUTATED_PDBS_DIR="$mutated_pdbs"
+
+python - << 'PYEOF'
+import json, os, glob
+
+parsed       = os.environ["PARSED_JSONL"]
+out_file     = os.environ["FIXED_JSONL"]
+mutated_dir  = os.environ["MUTATED_PDBS_DIR"]
+
+AA3_TO_1 = {
+    "ALA":"A","ARG":"R","ASN":"N","ASP":"D","CYS":"C","GLN":"Q","GLU":"E",
+    "GLY":"G","HIS":"H","ILE":"I","LEU":"L","LYS":"K","MET":"M","PHE":"F",
+    "PRO":"P","SER":"S","THR":"T","TRP":"W","TYR":"Y","VAL":"V",
+    "MSE":"M","HSD":"H","HSE":"H","HSP":"H"
+}
+
+def chain_b_resnames(pdb_path):
+    """Ordered list of chain B residue names, by ascending resnum."""
+    residues = {}
+    with open(pdb_path) as f:
+        for line in f:
+            if line[:4] not in ("ATOM", "HETA"):
+                continue
+            if line[21] != "B":
+                continue
+            resnum  = int(line[22:26].strip())
+            resname = line[17:20].strip()
+            if resnum not in residues:
+                residues[resnum] = resname
+    return [residues[rn] for rn in sorted(residues)]
+
+written = skipped = 0
+
+with open(parsed) as f_in, open(out_file, "w") as f_out:
+    for line in f_in:
+        line = line.strip()
+        if not line:
+            continue
+        entry = json.loads(line)
+        name  = entry["name"]
+        seq   = entry.get("seq_chain_B", "")
+        if not seq or len(seq) < 2:
+            skipped += 1
+            continue
+
+        pdb_path = os.path.join(mutated_dir, f"{name}.pdb")
+        if not os.path.isfile(pdb_path):
+            print(f"  WARNING: no mutated PDB found for {name} — falling back to termini-only fix")
+            fixed_positions = [1, len(seq)]
+        else:
+            resnames = chain_b_resnames(pdb_path)
+            if len(resnames) != len(seq):
+                print(f"  WARNING: {name} chain B residue count mismatch "
+                      f"(pdb={len(resnames)}, seq={len(seq)}) — falling back to termini-only fix")
+                fixed_positions = [1, len(seq)]
+            else:
+                # Fix everything that is NOT glycine — this naturally
+                # includes the CYS termini from Step 2 as well as any
+                # conserved motif residues carried over from RFdiffusion.
+                fixed_positions = [
+                    i + 1 for i, rn in enumerate(resnames) if rn != "GLY"
+                ]
+                if not fixed_positions:
+                    print(f"  WARNING: {name} chain B has no non-GLY residues to fix")
+
+        n_design = len(seq) - len(fixed_positions)
+        print(f"  {name}: fixing {len(fixed_positions)}/{len(seq)} positions "
+              f"({n_design} G's left designable)")
+
+        f_out.write(json.dumps({name: {"B": fixed_positions}}) + "\n")
+        written += 1
+
+print(f"Wrote fixed_positions.jsonl: {written} entries, {skipped} skipped")
+PYEOF
+
+# =============================================================================
+# STEP 6 — Bias by residue (block CYS at internal positions)
+# =============================================================================
+
+echo ""
+echo "--- STEP 6: Setting residue bias ---"
+
+export BIAS_JSONL="$bias_by_res_jsonl"
+
+python - << 'PYEOF'
+import json, sys, os
+import numpy as np
+
+parsed   = os.environ["PARSED_JSONL"]
+out_file = os.environ["BIAS_JSONL"]
+
+ALPHABET  = "ACDEFGHIKLMNPQRSTVWYX"
+CYS_IDX   = ALPHABET.index("C")
+CYS_BLOCK = -1e8
+NUM_AA    = len(ALPHABET)
+written = skipped = 0
+
+with open(parsed) as f_in, open(out_file, "w") as f_out:
+    for line in f_in:
+        line = line.strip()
+        if not line:
+            continue
+        entry = json.loads(line)
+        name  = entry["name"]
+        bias_record = {}
+
+        for chain_key in entry:
+            if not chain_key.startswith("seq_chain_"):
+                continue
+            chain = chain_key.split("_chain_")[1]
+            seq   = entry[chain_key]
+            L     = len(seq)
+            if L < 1:
+                continue
+            bias_matrix = np.zeros((L, NUM_AA), dtype=np.float32)
+            if chain == "B" and L > 2:
+                bias_matrix[1:L-1, CYS_IDX] = CYS_BLOCK
+            bias_record[chain] = bias_matrix.tolist()
+
+        if not bias_record:
+            skipped += 1
+            continue
+        f_out.write(json.dumps({name: bias_record}) + "\n")
+        written += 1
+
+print(f"Wrote bias_by_res.jsonl: {written} entries, {skipped} skipped")
+PYEOF
+
+# =============================================================================
+# STEP 7 — Run CyclicMPNN (GPU 0 only)
+# =============================================================================
+
+echo ""
+echo "--- STEP 7: Running CyclicMPNN ---"
+
+if [ -d "$output_dir/seqs" ] && [ "$(ls -A "$output_dir/seqs" 2>/dev/null)" ]; then
+    echo "  Sequences already exist in $output_dir/seqs — skipping CyclicMPNN"
+else
+    CUDA_VISIBLE_DEVICES=0 python "$CYCLICMPNN_DIR/protein_mpnn_run.py" \
+    --path_to_model_weights "$CYCLICMPNN_DIR/cyclicmpnn_weights" \
+    --model_name cyclicmpnn_48_010 \
+    --jsonl_path "$parsed_jsonl" \
+    --chain_id_jsonl "$chain_jsonl" \
+    --fixed_positions_jsonl "$fixed_jsonl" \
+    --bias_by_res_jsonl "$bias_by_res_jsonl" \
+    --out_folder "$output_dir" \
+    --num_seq_per_target 5 \
+    --sampling_temp 0.3 \
+    --seed 37 \
+    --batch_size 1
+fi
+
+echo "CyclicMPNN complete."
+conda deactivate
+
+# =============================================================================
+# STEP 8 — Build AF3 JSON inputs from CyclicMPNN FASTA output
+# Extracts KRAS (chain A) from mutated PDBs automatically
+# =============================================================================
+
+echo ""
+echo "--- STEP 8: Building AlphaFold3 input JSONs ---"
+
+export MPNN_OUT="$output_dir"
+export MUTATED_PDBS="$mutated_pdbs"
+export AF3_INPUT_DIR="$af3_input_dir"
+
+if [ -f "$af3_input_dir/apo_jobs.txt" ] && [ -s "$af3_input_dir/apo_jobs.txt" ]; then
+    echo "  AF3 input JSONs already exist — skipping generation"
+    source ~/miniconda3/bin/activate mlfold
+else
+    source ~/miniconda3/bin/activate mlfold
+
+    python - << 'PYEOF'
+import os, glob, json, re, hashlib
+
+mpnn_out      = os.environ["MPNN_OUT"]
+mutated_pdbs  = os.environ["MUTATED_PDBS"]
+af3_input_dir = os.environ["AF3_INPUT_DIR"]
+
+AA3_TO_1 = {
+    "ALA":"A","ARG":"R","ASN":"N","ASP":"D","CYS":"C","GLN":"Q","GLU":"E",
+    "GLY":"G","HIS":"H","ILE":"I","LEU":"L","LYS":"K","MET":"M","PHE":"F",
+    "PRO":"P","SER":"S","THR":"T","TRP":"W","TYR":"Y","VAL":"V",
+    "MSE":"M","HSD":"H","HSE":"H","HSP":"H"
+}
+
+def chain_seq_from_pdb(pdb_path, chain_id):
+    residues = {}
+    with open(pdb_path) as f:
+        for line in f:
+            if line[:4] != "ATOM":
+                continue
+            if line[21] != chain_id:
+                continue
+            resnum  = int(line[22:26].strip())
+            resname = line[17:20].strip()
+            if resnum not in residues:
+                residues[resnum] = resname
+    return "".join(AA3_TO_1.get(residues[rn], "X") for rn in sorted(residues))
+
+kras_seqs = {}
+for pdb_path in sorted(glob.glob(os.path.join(mutated_pdbs, "*.pdb"))):
+    stem = os.path.splitext(os.path.basename(pdb_path))[0]
+    seq  = chain_seq_from_pdb(pdb_path, "A")
+    if seq:
+        kras_seqs[stem] = seq
+        print(f"  KRAS chain A for {stem}: {len(seq)} aa")
+    else:
+        print(f"  WARNING: no chain A in {stem}")
+
+fasta_dir = os.path.join(mpnn_out, "seqs")
+if not os.path.isdir(fasta_dir):
+    raise FileNotFoundError(f"FASTA directory not found: {fasta_dir}")
+
+fasta_files = sorted(glob.glob(os.path.join(fasta_dir, "*.fa")))
+if not fasta_files:
+    raise FileNotFoundError(f"No .fa files in {fasta_dir}")
+
+print(f"\nFound {len(fasta_files)} FASTA file(s)")
+
+apo_jobs     = []
+complex_jobs = []
+
+for fa_path in fasta_files:
+    pdb_stem = os.path.splitext(os.path.basename(fa_path))[0]
+
+    entries = []
+    current_header, current_seq = None, []
+    with open(fa_path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                if current_header is not None:
+                    entries.append((current_header, "".join(current_seq)))
+                current_header = line[1:]
+                current_seq    = []
+            else:
+                current_seq.append(line)
+    if current_header is not None:
+        entries.append((current_header, "".join(current_seq)))
+
+    designs = entries[1:] if len(entries) > 1 else entries
+
+    kras_seq = kras_seqs.get(pdb_stem) or next(
+        (v for k, v in kras_seqs.items() if pdb_stem in k or k in pdb_stem), None
+    )
+
+    for idx, (header, pep_seq) in enumerate(designs, start=1):
+        score_match = re.search(r"score=([\d.eE+\-]+)", header)
+        score_str   = score_match.group(1) if score_match else "NA"
+        safe_name   = re.sub(r"[^A-Za-z0-9_\-]", "_", pdb_stem)
+        job_name    = f"{safe_name}_seq{idx:02d}"
+
+        # Apo — single seed, 5 samples
+        apo_json = {
+            "name": f"{job_name}_apo",
+            "modelSeeds": [42],
+            "sequences": [{"protein": {"id": "A", "sequence": pep_seq}}],
+            "dialect": "alphafold3",
+            "version": 2
+        }
+        apo_path = os.path.join(af3_input_dir, f"{job_name}_apo.json")
+        with open(apo_path, "w") as f:
+            json.dump(apo_json, f, indent=2)
+        apo_jobs.append(apo_path)
+
+        if kras_seq:
+            # Complex — 4 unique seeds, 20 samples total
+            seeds = []
+            for i in range(4):
+                seed = int(hashlib.md5(f"{job_name}_{i}".encode()).hexdigest()[:8], 16) % 100000
+                seeds.append(seed)
+
+            complex_json = {
+                "name": f"{job_name}_complex",
+                "modelSeeds": seeds,
+                "sequences": [
+                    {"protein": {"id": "A", "sequence": kras_seq}},
+                    {"protein": {"id": "B", "sequence": pep_seq}}
+                ],
+                "dialect": "alphafold3",
+                "version": 2
+            }
+            complex_path = os.path.join(af3_input_dir, f"{job_name}_complex.json")
+            with open(complex_path, "w") as f:
+                json.dump(complex_json, f, indent=2)
+            complex_jobs.append(complex_path)
+        else:
+            print(f"  WARNING: no KRAS seq for {pdb_stem} — complex job skipped")
+
+        print(f"  {job_name}  mpnn_score={score_str}  pep_len={len(pep_seq)}")
+
+with open(os.path.join(af3_input_dir, "apo_jobs.txt"), "w") as f:
+    f.write("\n".join(apo_jobs) + "\n")
+with open(os.path.join(af3_input_dir, "complex_jobs.txt"), "w") as f:
+    f.write("\n".join(complex_jobs) + "\n")
+
+print(f"\nAPO jobs     : {len(apo_jobs)}")
+print(f"Complex jobs : {len(complex_jobs)}")
+print(f"Total AF3    : {len(apo_jobs) + len(complex_jobs)}")
+PYEOF
+fi
+
+conda deactivate
+
+# =============================================================================
+# STEP 8b — Submit Job 2 (complex predictions) now that input JSONs exist
+# =============================================================================
+
+echo ""
+echo "--- STEP 8b: Submitting Job 2 (complex predictions) ---"
+
+JOB2_ID=$(sbatch \
+--export=AF3_INPUT_DIR="$af3_input_dir",AF3_OUTPUT_DIR="$AF3_OUTPUT_DIR",AF3_SIF="$AF3_SIF",AF3_MODELS="$AF3_MODELS",AF3_DB="$AF3_DB",APPTAINER="$APPTAINER" \
+"$JOB2_SCRIPT" | awk '{print $NF}')
+
+echo "  Job 2 submitted — SLURM job ID: $JOB2_ID"
+echo "  Monitor with : squeue -j $JOB2_ID"
+echo "  Output log   : af3_complex_${JOB2_ID}.out"
+
+# =============================================================================
+# STEP 9 — Run AF3 apo predictions across all 3 GPUs
+# set -e is disabled from here on so that individual prediction failures
+# do not abort the rest of the GPU queue.
+# =============================================================================
+
+set +e
+
+echo ""
+echo "--- STEP 9: Running AF3 apo predictions (3 x L40S GPUs) ---"
+
+run_af3_apo_job() {
+    local json_file="$1"
+    local gpu_id="$2"
+    local job_name
+    job_name=$(basename "$json_file" .json)
+    local json_basename
+    json_basename=$(basename "$json_file")
+    local log_file="$af3_logs/${job_name}.log"
+
+    local apptainer_tmp="/tmp/apptainer_apo_gpu${gpu_id}_$$"
+    mkdir -p "$apptainer_tmp/tmp" "$apptainer_tmp/cache" "$apptainer_tmp/run"
+    mkdir -p "$apptainer_tmp/container_tmp"
+
+    echo "  [GPU $gpu_id] Starting: $job_name"
+
+    # Skip if already completed
+    if find "$af3_apo_dir/$job_name" -name "*sample-0*_summary_confidences.json" 2>/dev/null | grep -q .; then
+        echo "  [GPU $gpu_id] Skipping (already complete): $job_name"
+        return 0
+    fi
+
+    APPTAINER_TMPDIR="$apptainer_tmp/tmp" \
+    APPTAINER_CACHEDIR="$apptainer_tmp/cache" \
+    APPTAINER_RUNDIR="$apptainer_tmp/run" \
+    CUDA_VISIBLE_DEVICES="$gpu_id" \
+    "$APPTAINER" exec \
+        --nv \
+        --bind "$af3_input_dir":/root/af_input \
+        --bind "$af3_apo_dir":/root/af_output \
+        --bind "$AF3_DB":/root/public_databases \
+        --bind "$AF3_MODELS":/root/models \
+        --bind "$apptainer_tmp/container_tmp":/tmp \
+        "$AF3_SIF" \
+        /bin/bash -c "cd /app/alphafold && /alphafold3_venv/bin/python run_alphafold.py \
+            --json_path=/root/af_input/${json_basename} \
+            --model_dir=/root/models \
+            --db_dir=/root/public_databases \
+            --output_dir=/root/af_output \
+            --gpu_device=0 \
+            --jackhmmer_n_cpu=4 \
+            --nhmmer_n_cpu=4 \
+            --run_data_pipeline=true \
+            --run_inference=true \
+            --force_output_dir=true" \
+        > "$log_file" 2>&1
+
+    local rc=$?
+    rm -rf "$apptainer_tmp"
+
+    if [ $rc -eq 0 ]; then
+        echo "  [GPU $gpu_id] Done   : $job_name"
+    else
+        echo "  [GPU $gpu_id] FAILED : $job_name (rc=$rc) — see $log_file"
+        # Print last 20 lines of log to main output for easier debugging
+        echo "  --- Last 20 lines of $log_file ---"
+        tail -20 "$log_file"
+        echo "  ---"
+    fi
+    return 0
+}
+
+export -f run_af3_apo_job
+export af3_logs af3_input_dir af3_apo_dir AF3_DB AF3_MODELS AF3_SIF APPTAINER
+echo "--- Checking apo_jobs.txt ---"
+echo "Total jobs: $(wc -l < "$af3_input_dir/apo_jobs.txt")"
+head -3 "$af3_input_dir/apo_jobs.txt"
+
+# GPU 0 — jobs 0, 3, 6, 9 ...
+(
+idx=0
+while IFS= read -r json_file; do
+    [ -z "$json_file" ] && { (( idx++ )) || true; continue; }
+    if (( idx % 3 == 0 )); then run_af3_apo_job "$json_file" 0; fi
+    (( idx++ )) || true
+done < "$af3_input_dir/apo_jobs.txt"
+) &
+GPU0_PID=$!
+
+# GPU 1 — jobs 1, 4, 7, 10 ...
+(
+idx=0
+while IFS= read -r json_file; do
+    [ -z "$json_file" ] && { (( idx++ )) || true; continue; }
+    if (( idx % 3 == 1 )); then run_af3_apo_job "$json_file" 1; fi
+    (( idx++ )) || true
+done < "$af3_input_dir/apo_jobs.txt"
+) &
+GPU1_PID=$!
+
+# GPU 2 — jobs 2, 5, 8, 11 ...
+(
+idx=0
+while IFS= read -r json_file; do
+    [ -z "$json_file" ] && { (( idx++ )) || true; continue; }
+    if (( idx % 3 == 2 )); then run_af3_apo_job "$json_file" 2; fi
+    (( idx++ )) || true
+done < "$af3_input_dir/apo_jobs.txt"
+) &
+GPU2_PID=$!
+
+echo "  Waiting for all apo GPU queues to finish..."
+wait $GPU0_PID
+wait $GPU1_PID
+wait $GPU2_PID
+
+# Count outcomes from logs
+total_apo=$(wc -l < "$af3_input_dir/apo_jobs.txt")
+apo_passed=$(find "$af3_apo_dir" -name "*sample-0*_summary_confidences.json" | wc -l || true)
+apo_failed=$(( total_apo - apo_passed ))
+
+echo ""
+echo "======================================================================"
+echo " Job 1 complete — apo predictions finished"
+echo " Finished         : $(date)"
+echo ""
+echo " CyclicMPNN seqs  : $output_dir/seqs/"
+echo " AF3 inputs       : $af3_input_dir"
+echo " AF3 apo structs  : $af3_apo_dir"
+echo " AF3 apo logs     : $af3_logs"
+echo " Apo passed       : $apo_passed"
+echo " Apo failed       : $apo_failed"
+echo " Complex job ID   : $JOB2_ID"
+echo " NOTE: Final summary CSV written by Job $JOB2_ID on completion"
+echo "======================================================================"
