@@ -1,0 +1,295 @@
+"""
+compare_sequences_excel.py
+
+Compare two pools of sequences stored in separate Excel files,
+and report what percentage of Group A sequences appear in Group B.
+
+Usage:
+    python compare_sequences_excel.py <file_a.xlsx> <file_b.xlsx> \
+        [--sheet-a Sheet1] [--col-a sequence] \
+        [--sheet-b Sheet1] [--col-b sequence] \
+        [--output results.xlsx] [--ignore-case]
+
+Arguments:
+    file_a.xlsx     Path to the Excel file containing Group A
+    file_b.xlsx     Path to the Excel file containing Group B
+    --sheet-a       Sheet name to use in Group A file (default: first sheet)
+    --col-a         Column header for sequences in Group A (default: auto-detect)
+    --sheet-b       Sheet name to use in Group B file (default: first sheet)
+    --col-b         Column header for sequences in Group B (default: auto-detect)
+    --output        Path for the output results workbook  (default: comparison_results.xlsx)
+    --filter-output Path to save a filtered copy of Group B with Group A sequences removed
+    --ignore-case   Compare sequences case-insensitively
+"""
+
+import argparse
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def detect_sequence_column(df: pd.DataFrame, file_label: str) -> str:
+    """Guess which column contains sequences (longest avg string length)."""
+    str_cols = df.select_dtypes(include="str").columns
+    if len(str_cols) == 0:
+        raise ValueError(f"No text columns found in {file_label}.")
+    if len(str_cols) == 1:
+        return str_cols[0]
+    return max(str_cols, key=lambda c: df[c].dropna().astype(str).str.len().mean())
+
+
+def load_sequences(path: str, sheet: str | None, col: str | None,
+                   ignore_case: bool, label: str) -> tuple[list[str], str, str]:
+    """Return (sequences, sheet_used, column_used)."""
+    is_csv = Path(path).suffix.lower() == ".csv"
+
+    if is_csv:
+        df = pd.read_csv(path, dtype=str)
+        sheet = "CSV"  # placeholder for reporting
+    else:
+        xl = pd.ExcelFile(path)
+        sheet = sheet or xl.sheet_names[0]
+        df = pd.read_excel(path, sheet_name=sheet, dtype=str)
+
+    df.columns = df.columns.str.strip()
+
+    if col is None:
+        col = detect_sequence_column(df, label)
+        print(f"  Auto-detected sequence column in {label}: '{col}'")
+    elif col not in df.columns:
+        loc = "file" if is_csv else f"sheet '{sheet}'"
+        raise ValueError(f"Column '{col}' not found in {label} {loc}. "
+                         f"Available: {list(df.columns)}")
+
+    seqs = df[col].dropna().str.strip().tolist()
+    if ignore_case:
+        seqs = [s.upper() for s in seqs]
+    return seqs, sheet, col
+
+
+def compare(group_a: list[str], group_b: list[str]) -> dict:
+    unique_a  = list(dict.fromkeys(group_a))
+    set_b     = set(group_b)
+    found     = [s for s in unique_a if s in set_b]
+    not_found = [s for s in unique_a if s not in set_b]
+    pct = len(found) / len(unique_a) * 100 if unique_a else 0.0
+    return {
+        "total_a": len(group_a), "total_b": len(group_b),
+        "unique_a": unique_a,    "found": found,
+        "not_found": not_found,  "percent_found": pct,
+    }
+
+
+# ── Terminal report ───────────────────────────────────────────────────────────
+
+def print_report(results: dict, file_a: str, file_b: str,
+                 sheet_a: str, sheet_b: str) -> None:
+    n_unique = len(results["unique_a"])
+    n_found  = len(results["found"])
+    print()
+    print("=" * 58)
+    print("  SEQUENCE POOL COMPARISON REPORT")
+    print("=" * 58)
+    print(f"  Group A file  : {Path(file_a).name}  (sheet: {sheet_a})")
+    print(f"  Group B file  : {Path(file_b).name}  (sheet: {sheet_b})")
+    print("-" * 58)
+    print(f"  Group A total          : {results['total_a']}")
+    print(f"  Group A unique         : {n_unique}")
+    print(f"  Group B total          : {results['total_b']}")
+    print("-" * 58)
+    print(f"  Found in Group B       : {n_found} / {n_unique}")
+    print(f"  Percentage found       : {results['percent_found']:.2f}%")
+    print("=" * 58)
+    if results["not_found"]:
+        print(f"\n  Group A sequences NOT in Group B ({len(results['not_found'])}):")
+        for s in results["not_found"]:
+            print(f"    {s}")
+    else:
+        print("\n  All Group A sequences are present in Group B.")
+    print()
+
+
+# ── Excel output ──────────────────────────────────────────────────────────────
+
+GREEN  = "C6EFCE"; GREEN_FT = "276221"
+RED    = "FFC7CE"; RED_FT   = "9C0006"
+GREY   = "F2F2F2"
+HEADER = "2E4057"
+
+
+def _cell(ws, row, col, value, bold=False, bg=None, ft_color="000000",
+          align="left", number_format=None):
+    c = ws.cell(row=row, column=col, value=value)
+    c.font = Font(bold=bold, color=ft_color, name="Arial",
+                  size=10 if not bold else 11)
+    if bg:
+        c.fill = PatternFill("solid", start_color=bg)
+    c.alignment = Alignment(horizontal=align, vertical="center")
+    thin = Side(style="thin", color="CCCCCC")
+    c.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    if number_format:
+        c.number_format = number_format
+    return c
+
+
+def write_results(out_path: str, results: dict,
+                  file_a: str, file_b: str,
+                  sheet_a: str, sheet_b: str,
+                  col_a: str, col_b: str) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Comparison Results"
+
+    n_unique = len(results["unique_a"])
+    n_found  = len(results["found"])
+
+    # Header banner
+    ws.row_dimensions[1].height = 28
+    c = ws.cell(row=1, column=1, value="SEQUENCE POOL COMPARISON RESULTS")
+    c.font = Font(bold=True, size=13, color="FFFFFF", name="Arial")
+    c.fill = PatternFill("solid", start_color=HEADER)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells("A1:C1")
+
+    # Summary table
+    labels = [
+        ("Group A file",            Path(file_a).name),
+        ("Group A sheet",           sheet_a),
+        ("Group A sequence column", col_a),
+        ("Group B file",            Path(file_b).name),
+        ("Group B sheet",           sheet_b),
+        ("Group B sequence column", col_b),
+        ("Group A total sequences", results["total_a"]),
+        ("Group A unique sequences",n_unique),
+        ("Group B total sequences", results["total_b"]),
+        ("Found in Group B",        n_found),
+        ("NOT found in Group B",    len(results["not_found"])),
+        ("% of Group A in Group B", results["percent_found"] / 100),
+        ("Run timestamp",           datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    ]
+    for i, (lbl, val) in enumerate(labels, start=2):
+        ws.row_dimensions[i].height = 18
+        _cell(ws, i, 1, lbl, bold=True, bg=GREY)
+        fmt = "0.00%" if lbl.startswith("%") else None
+        _cell(ws, i, 2, val, number_format=fmt)
+
+    # Found sequences
+    r = len(labels) + 4
+    ws.cell(row=r, column=1,
+            value=f"✓ Found in Group B ({n_found})").font = \
+        Font(bold=True, size=11, color=GREEN_FT, name="Arial")
+    ws.row_dimensions[r].height = 20
+    r += 1
+    _cell(ws, r, 1, "Sequence", bold=True, bg=GREEN, ft_color=GREEN_FT)
+    _cell(ws, r, 2, "Status",   bold=True, bg=GREEN, ft_color=GREEN_FT)
+    for seq in results["found"]:
+        r += 1
+        _cell(ws, r, 1, seq,     bg="EBF5EB")
+        _cell(ws, r, 2, "Found", bg="EBF5EB", ft_color=GREEN_FT)
+
+    # Not-found sequences
+    r += 2
+    ws.cell(row=r, column=1,
+            value=f"✗ NOT Found in Group B ({len(results['not_found'])})").font = \
+        Font(bold=True, size=11, color=RED_FT, name="Arial")
+    ws.row_dimensions[r].height = 20
+    r += 1
+    _cell(ws, r, 1, "Sequence",  bold=True, bg=RED, ft_color=RED_FT)
+    _cell(ws, r, 2, "Status",    bold=True, bg=RED, ft_color=RED_FT)
+    for seq in results["not_found"]:
+        r += 1
+        _cell(ws, r, 1, seq,         bg="FFF0F0")
+        _cell(ws, r, 2, "Not found", bg="FFF0F0", ft_color=RED_FT)
+
+    ws.column_dimensions["A"].width = 38
+    ws.column_dimensions["B"].width = 16
+    ws.column_dimensions["C"].width = 16
+
+    wb.save(out_path)
+    print(f"  Results saved to: {out_path}")
+
+
+# ── Filtered output ───────────────────────────────────────────────────────────
+
+def write_filtered(file_b: str, sheet_b: str, col_b: str,
+                   set_a: set, ignore_case: bool, out_path: str) -> None:
+    """Save a copy of file B with any rows whose sequence appears in Group A removed."""
+    is_csv = Path(file_b).suffix.lower() == ".csv"
+
+    if is_csv:
+        df = pd.read_csv(file_b, dtype=str)
+    else:
+        df = pd.read_excel(file_b, sheet_name=sheet_b, dtype=str)
+
+    df.columns = df.columns.str.strip()
+
+    col_data = df[col_b].str.strip()
+    if ignore_case:
+        mask = ~col_data.str.upper().isin(set_a)
+    else:
+        mask = ~col_data.isin(set_a)
+
+    df_filtered = df[mask]
+    n_removed = len(df) - len(df_filtered)
+
+    out_is_csv = Path(out_path).suffix.lower() == ".csv"
+    if out_is_csv:
+        df_filtered.to_csv(out_path, index=False)
+    else:
+        df_filtered.to_excel(out_path, index=False)
+
+    print(f"  Filtered file saved to: {out_path}")
+    print(f"  Rows removed: {n_removed}  |  Rows kept: {len(df_filtered)}")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("file_a",     help="Excel file containing Group A sequences")
+    p.add_argument("file_b",     help="Excel file containing Group B sequences")
+    p.add_argument("--sheet-a",  default=None, help="Sheet name in Group A file")
+    p.add_argument("--sheet-b",  default=None, help="Sheet name in Group B file")
+    p.add_argument("--col-a",    default=None, help="Sequence column in Group A")
+    p.add_argument("--col-b",    default=None, help="Sequence column in Group B")
+    p.add_argument("--output",   default="comparison_results.xlsx",
+                                 help="Output file path (default: comparison_results.xlsx)")
+    p.add_argument("--filter-output", default=None,
+                                 help="Save a filtered copy of Group B with Group A sequences removed")
+    p.add_argument("--ignore-case", action="store_true",
+                                 help="Compare sequences case-insensitively")
+    args = p.parse_args()
+
+    for f in (args.file_a, args.file_b):
+        if not Path(f).exists():
+            sys.exit(f"Error: file not found — {f}")
+
+    print(f"\nLoading Group A from: {args.file_a}")
+    seqs_a, sheet_a, col_a = load_sequences(
+        args.file_a, args.sheet_a, args.col_a, args.ignore_case, "Group A")
+
+    print(f"Loading Group B from: {args.file_b}")
+    seqs_b, sheet_b, col_b = load_sequences(
+        args.file_b, args.sheet_b, args.col_b, args.ignore_case, "Group B")
+
+    results = compare(seqs_a, seqs_b)
+
+    print_report(results, args.file_a, args.file_b, sheet_a, sheet_b)
+    write_results(args.output, results, args.file_a, args.file_b,
+                  sheet_a, sheet_b, col_a, col_b)
+
+    if args.filter_output:
+        set_a = set(seqs_a) if not args.ignore_case else {s.upper() for s in seqs_a}
+        write_filtered(args.file_b, sheet_b, col_b,
+                       set_a, args.ignore_case, args.filter_output)
+
+
+if __name__ == "__main__":
+    main()
