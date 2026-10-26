@@ -1,0 +1,125 @@
+## compare sequences within one group to remove all replicates 
+
+"""
+count_sequences.py
+Count how many times each sequence appears in a single Excel or CSV file,
+and summarise how many unique sequences there are vs duplicates.
+Optionally write a deduplicated copy of the file (first occurrence kept).
+Usage:
+    python count_sequences.py <file.xlsx|file.csv> [--sheet Sheet1] [--col sequence_column] [--output out.csv]
+Arguments:
+    file        Path to the Excel (.xlsx) or CSV (.csv) file
+    --sheet     Sheet name to use (default: first sheet; ignored for CSV)
+    --col       Column header containing sequences (default: auto-detect)
+    --output    Path for the deduplicated output file (.csv or .xlsx)
+"""
+import argparse
+import sys
+from pathlib import Path
+from collections import Counter
+import pandas as pd
+
+
+def detect_sequence_column(df: pd.DataFrame) -> str:
+    str_cols = df.select_dtypes(include="object").columns
+    if len(str_cols) == 0:
+        raise ValueError("No text columns found.")
+    if len(str_cols) == 1:
+        return str_cols[0]
+    return max(str_cols, key=lambda c: df[c].dropna().astype(str).str.len().mean())
+
+
+def load_file(filepath: str, sheet: str | None) -> tuple[pd.DataFrame, str]:
+    """Load an Excel or CSV file, returning (dataframe, sheet_label)."""
+    suffix = Path(filepath).suffix.lower()
+
+    if suffix == ".csv":
+        df = pd.read_csv(filepath, dtype=str)
+        df.columns = df.columns.str.strip()
+        return df, "N/A (CSV)"
+
+    elif suffix in (".xlsx", ".xls", ".xlsm"):
+        xl = pd.ExcelFile(filepath)
+        sheet_name = sheet or xl.sheet_names[0]
+        df = pd.read_excel(filepath, sheet_name=sheet_name, dtype=str)
+        df.columns = df.columns.str.strip()
+        return df, sheet_name
+
+    else:
+        sys.exit(f"Error: unsupported file type '{suffix}'. Expected .csv or .xlsx.")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("file",    help="Excel (.xlsx) or CSV (.csv) file to analyse")
+    p.add_argument("--sheet", default=None, help="Sheet name (Excel only; default: first sheet)")
+    p.add_argument("--col",    default=None, help="Sequence column header (default: auto-detect)")
+    p.add_argument("--output", default=None, help="Path for deduplicated output file (.csv or .xlsx)")
+    args = p.parse_args()
+
+    if not Path(args.file).exists():
+        sys.exit(f"Error: file not found — {args.file}")
+
+    df, sheet_label = load_file(args.file, args.sheet)
+
+    col = args.col
+    if col is None:
+        col = detect_sequence_column(df)
+        print(f"  Auto-detected sequence column: '{col}'")
+    elif col not in df.columns:
+        sys.exit(f"Error: column '{col}' not found. Available: {list(df.columns)}")
+
+    seqs   = df[col].dropna().str.strip().tolist()
+    counts = Counter(seqs)
+    total  = len(seqs)
+    unique = len(counts)
+    dupes  = sum(1 for c in counts.values() if c > 1)
+
+    print()
+    print("=" * 50)
+    print("  SEQUENCE DIVERSITY REPORT")
+    print("=" * 50)
+    print(f"  File            : {Path(args.file).name}")
+    print(f"  Sheet           : {sheet_label}")
+    print(f"  Column          : {col}")
+    print("-" * 50)
+    print(f"  Total sequences : {total}")
+    print(f"  Unique sequences: {unique}")
+    print(f"  Duplicated seqs : {dupes}  (appear more than once)")
+    print(f"  Singletons      : {unique - dupes}  (appear exactly once)")
+    print("=" * 50)
+
+    if dupes > 0:
+        print(f"\n  Sequences appearing more than once:")
+        print(f"  {'Count':<8} Sequence")
+        print(f"  {'-'*6}   {'-'*30}")
+        for seq, count in sorted(counts.items(), key=lambda x: -x[1]):
+            if count > 1:
+                print(f"  {count:<8} {seq}")
+    print()
+
+    # --- Optional deduplicated output ---
+    if args.output:
+        out_path = Path(args.output)
+        out_suffix = out_path.suffix.lower()
+
+        # Keep first occurrence of each sequence, drop subsequent duplicates
+        df_dedup = df.drop_duplicates(subset=[col], keep="first")
+        removed  = len(df) - len(df_dedup)
+
+        if out_suffix == ".csv":
+            df_dedup.to_csv(out_path, index=False)
+        elif out_suffix in (".xlsx", ".xls", ".xlsm"):
+            df_dedup.to_excel(out_path, index=False, sheet_name=sheet_label if sheet_label != "N/A (CSV)" else "Sheet1")
+        else:
+            sys.exit(f"Error: unsupported output format '{out_suffix}'. Use .csv or .xlsx.")
+
+        print(f"  Deduplicated file saved : {out_path}")
+        print(f"  Rows removed            : {removed}")
+        print(f"  Rows retained           : {len(df_dedup)}")
+        print()
+
+
+if __name__ == "__main__":
+    main()
