@@ -1,0 +1,445 @@
+## compare a sequence to an Adhiron sequence 
+
+"""
+Cyclic Peptide Sequence Search
+================================
+Searches a list of cyclic peptides (from a CSV or Excel file) for matches
+against a query sequence, accounting for:
+  - Cyclic nature: the peptide wraps around so matches can span the end/start
+  - Both forward and reverse orientations
+  - Contiguous matches of a minimum length (the "anchor")
+  - Anchored positional similarity: once an anchor is placed, additional
+    query residues that align to the same positions in the peptide are
+    reported even if they are not contiguous with the anchor
+
+Example
+-------
+Query  : ABCDEF
+Peptide: GGABGGEG
+  Anchor "AB" found at peptide pos 2 (forward).
+  Aligning the full query over the peptide from that offset:
+    query[0]=A -> peptide[2]=A  match
+    query[1]=B -> peptide[3]=B  match
+    query[4]=E -> peptide[6]=E  match  <-- gapped positional hit
+  Total aligned residues: 3 (A, B, E)
+
+Usage
+-----
+  python cyclic_peptide_search.py --query HFTPWFQRN --excel peptides.csv
+  python cyclic_peptide_search.py --query HFTPWFQRN --excel peptides.xlsx \\
+      --col Sequence --min-len 3 --top 50 --out matches.csv
+
+Requirements
+------------
+  pandas, openpyxl  (both in the peptide_rmsd conda env)
+  conda activate peptide_rmsd
+"""
+
+import argparse
+import sys
+import pandas as pd
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def cyclic_doubled(seq: str) -> str:
+    """Return seq+seq so wrap-around substrings are contiguous."""
+    return seq + seq
+
+
+def find_anchor_offsets(anchor: str, peptide: str) -> list[int]:
+    """
+    Return all start positions (0-indexed within the original peptide length)
+    where `anchor` appears in the cyclic peptide (forward orientation).
+    Uses the doubled-sequence trick for wrap-around.
+    """
+    n = len(peptide)
+    doubled = cyclic_doubled(peptide)
+    positions = []
+    start = 0
+    while True:
+        idx = doubled.find(anchor, start)
+        if idx == -1 or idx >= n:
+            break
+        positions.append(idx)
+        start = idx + 1
+    return positions
+
+
+# ── Core matching ──────────────────────────────────────────────────────────
+
+def aligned_residues(query: str, peptide: str, pep_anchor_start: int) -> dict:
+    """
+    Given that query[0] is aligned to peptide[pep_anchor_start % len(peptide)],
+    walk along query and check each residue against the corresponding cyclic
+    position in peptide.
+
+    Returns a dict with:
+      matched_positions : list of query indices that match
+      alignment_str     : visual string over peptide length, e.g. 'AB..E.'
+      n_matched         : total matched residues
+    """
+    n = len(peptide)
+    matched = []
+    pep_display = ['.'] * n  # shows aligned query residues over peptide
+
+    for qi, q_aa in enumerate(query):
+        pi = (pep_anchor_start + qi) % n
+        pep_display[pi] = q_aa
+        if q_aa == peptide[pi]:
+            matched.append(qi)
+
+    return {
+        "matched_positions": matched,
+        "alignment_str": ''.join(pep_display),
+        "n_matched": len(matched),
+    }
+
+
+def score_alignment(query: str, peptide: str, anchor_query_start: int,
+                    anchor_len: int, pep_anchor_start: int) -> dict:
+    """
+    Score one specific alignment: anchor starts at query[anchor_query_start]
+    and peptide[pep_anchor_start].  The full query is shifted so that
+    query[anchor_query_start] aligns with peptide[pep_anchor_start].
+    """
+    n = len(peptide)
+    # Shift so anchor_query_start aligns with pep_anchor_start
+    pep_offset = (pep_anchor_start - anchor_query_start) % n
+    result = aligned_residues(query, peptide, pep_offset)
+
+    # Build a compact matched-residues string (just the AA letters that matched)
+    matched_aas = ''.join(query[i] for i in result["matched_positions"])
+
+    return {
+        "anchor": query[anchor_query_start: anchor_query_start + anchor_len],
+        "anchor_query_start": anchor_query_start,
+        "anchor_pep_start": pep_anchor_start,
+        "n_matched": result["n_matched"],
+        "matched_positions": result["matched_positions"],
+        "matched_aas": matched_aas,
+        "alignment_str": result["alignment_str"],
+    }
+
+
+def find_all_alignments(query: str, peptide: str, min_len: int) -> list[dict]:
+    """
+    For every anchor (contiguous query substring of length >= min_len) that
+    appears in the cyclic peptide (forward or reverse), compute the full
+    positional alignment and collect all results.
+
+    Deduplicates on (orientation, pep_anchor_start, anchor_query_start) so
+    the same physical alignment isn't reported twice.
+    """
+    results = []
+    seen = set()  # (orientation, pep_offset) to avoid duplicate full alignments
+
+    orientations = [("forward", peptide), ("reverse", peptide[::-1])]
+
+    for orientation, pep in orientations:
+        n = len(pep)
+        max_anchor = min(len(query), n)
+
+        # Try anchors from longest to shortest so the best anchor is found first
+        for anchor_len in range(max_anchor, min_len - 1, -1):
+            for aq_start in range(len(query) - anchor_len + 1):
+                anchor = query[aq_start: aq_start + anchor_len]
+                offsets = find_anchor_offsets(anchor, pep)
+
+                for pep_offset in offsets:
+                    # The peptide position that aligns with query[aq_start]
+                    dedup_key = (orientation, (pep_offset - aq_start) % n)
+                    if dedup_key in seen:
+                        continue
+                    seen.add(dedup_key)
+
+                    aln = score_alignment(query, pep, aq_start, anchor_len, pep_offset)
+                    aln["orientation"] = orientation
+
+                    # If orientation is reverse, map anchor_pep_start back to
+                    # the original (forward) peptide coordinate for clarity
+                    if orientation == "reverse":
+                        aln["anchor_pep_start_fwd"] = (len(peptide) - 1 - pep_offset)
+                    else:
+                        aln["anchor_pep_start_fwd"] = pep_offset
+
+                    results.append(aln)
+
+    # Sort by total matched residues descending, then anchor length descending
+    results.sort(key=lambda r: (-r["n_matched"], -len(r["anchor"])))
+    return results
+
+
+# ── File loading ──────────────────────────────────────────────────────────
+
+def load_peptides(file_path: str, sheet, col) -> tuple[pd.DataFrame, str]:
+    """Load peptide sequences from CSV or Excel."""
+    ext = file_path.lower().rsplit(".", 1)[-1]
+    if ext == "csv":
+        df = pd.read_csv(file_path)
+    elif ext in ("xlsx", "xls", "xlsm"):
+        df = pd.read_excel(file_path, sheet_name=sheet or 0)
+    else:
+        try:
+            df = pd.read_csv(file_path)
+        except Exception:
+            df = pd.read_excel(file_path, sheet_name=sheet or 0)
+
+    df.columns = df.columns.str.strip()
+
+    if col:
+        if col not in df.columns:
+            sys.exit(f"ERROR: Column '{col}' not found. Available: {list(df.columns)}")
+        seq_col = col
+    else:
+        candidates = [c for c in df.columns
+                      if any(k in c.lower() for k in ("seq", "peptide", "aa", "amino"))]
+        seq_col = candidates[0] if candidates else df.columns[0]
+        print(f"  Auto-detected sequence column: '{seq_col}'")
+
+    name_col = df.columns[0]
+    if name_col == seq_col:
+        # sequence IS the first column — no separate name column
+        name_col = None
+    elif name_col:
+        print(f"  Using '{name_col}' as sequence name column.")
+    return df, seq_col, name_col
+
+
+# ── Output ────────────────────────────────────────────────────────────────
+
+def build_alignment_block(query: str, peptide: str, aln: dict) -> list[str]:
+    """
+    Build a three-line visual alignment block.
+
+    Strategy: unroll the cyclic peptide starting from the position that aligns
+    with query[0], so the display is always a straight left-to-right read with
+    no wrap-around scatter.  If the query is longer than the peptide the
+    peptide is shown doubled (one full cycle) to make the wrap visible.
+
+    For reverse hits the peptide is reversed first, then the same logic applies.
+
+    Returns [query_line, match_line, peptide_line].
+    '|' = exact match, ':' = aligned but different residue, ' ' = no query here.
+    """
+    orientation = aln["orientation"]
+    n = len(peptide)
+    disp_pep = peptide[::-1] if orientation == "reverse" else peptide
+
+    # pep_offset: index in disp_pep that aligns with query[0]
+    pep_offset = (aln["anchor_pep_start"] - aln["anchor_query_start"]) % n
+
+    # Unroll the peptide from pep_offset so column i == disp_pep[(pep_offset+i)%n]
+    # Show enough columns to cover the whole query, minimum one full cycle.
+    width = max(len(query), n)
+    unrolled = ''.join(disp_pep[(pep_offset + i) % n] for i in range(width))
+
+    q_chars = [' '] * width
+    m_chars = [' '] * width
+
+    for qi, q_aa in enumerate(query):
+        q_chars[qi] = q_aa
+        if q_aa == unrolled[qi]:
+            m_chars[qi] = '|'
+        else:
+            m_chars[qi] = ':'
+
+    return [''.join(q_chars), ''.join(m_chars), unrolled]
+
+
+def print_results(query: str, results: list[dict], min_len: int, top_n: int, file=None):
+    print(f"\n{'='*72}")
+    print(f"  Query           : {query}")
+    print(f"  Min anchor length: {min_len} AA")
+    print(f"{'='*72}\n")
+
+    if not results:
+        print("  No matches found.\n")
+        return
+
+    if top_n:
+        results = results[:top_n]
+
+    pad = "        "   # indent for alignment block
+
+    for i, r in enumerate(results, 1):
+        best = r["alignments"][0]
+        name_str = f"  [{i:>3}] {r['name']}" if r.get('name') else f"  [{i:>3}]"
+        print(f"{name_str}")
+        print(f"        Peptide  : {r['peptide']}")
+        print(f"        Row      : {r['row']}")
+        if r.get("extra_cols"):
+            for k, v in r["extra_cols"].items():
+                print(f"        {k:<9}: {v}")
+        print(f"        Score    : {best['n_matched']}/{len(query)} residues matched"
+              f"  anchor='{best['anchor']}'  [{best['orientation']}]")
+        print(f"        Matched  : {best['matched_aas']}")
+
+        # Three-line alignment
+        q_line, m_line, p_line = build_alignment_block(query, r['peptide'], best)
+        label_w = 8   # width of "Query : " etc.
+        print(f"{pad}{'Query':<{label_w}}: {q_line}")
+        print(f"{pad}{'':<{label_w}}  {m_line}")
+        print(f"{pad}{'Peptide':<{label_w}}: {p_line}"
+              + ("  [shown reversed]" if best['orientation'] == 'reverse' else ""))
+
+        if len(r["alignments"]) > 1:
+            print(f"        ({len(r['alignments'])-1} further alignment(s) not shown)")
+        print()
+
+
+def print_summary(query: str, results: list[dict], total_peptides: int):
+    """Print a summary table of match counts by number of residues matched."""
+    from collections import Counter
+    score_counts = Counter(r["best_n_matched"] for r in results)
+    n_query = len(query)
+
+    print(f"{'='*72}")
+    print(f"  SUMMARY")
+    print(f"{'='*72}")
+    print(f"  Total peptides scanned : {total_peptides}")
+    print(f"  Peptides with any match: {len(results)} "
+          f"({100*len(results)/total_peptides:.1f}% of total)" if total_peptides else "")
+    print(f"  Peptides with no match : {total_peptides - len(results)}")
+    print()
+    print(f"  Breakdown by best match score:")
+    print(f"  {'Residues matched':<20} {'Count':>6}  {'% of matches':>14}  {'% of total':>10}")
+    print(f"  {'-'*20} {'-'*6}  {'-'*14}  {'-'*10}")
+    for score in sorted(score_counts.keys(), reverse=True):
+        count = score_counts[score]
+        pct_matches = 100 * count / len(results) if results else 0
+        pct_total   = 100 * count / total_peptides if total_peptides else 0
+        print(f"  {score}/{n_query} AA{'':<13} {count:>6}  {pct_matches:>13.1f}%  {pct_total:>9.1f}%")
+    print(f"{'='*72}\n")
+
+
+def save_results_csv(results: list[dict], out_path: str, query: str):
+    rows = []
+    for r in results:
+        for aln in r["alignments"]:
+            row = {
+                "query": query,
+                "name": r.get("name", ""),
+                "peptide": r["peptide"],
+                "source_row": r["row"],
+                "orientation": aln["orientation"],
+                "anchor": aln["anchor"],
+                "anchor_query_start": aln["anchor_query_start"],
+                "anchor_pep_start_fwd": aln["anchor_pep_start_fwd"],
+                "n_matched": aln["n_matched"],
+                "n_query": len(query),
+                "frac_matched": round(aln["n_matched"] / len(query), 3),
+                "matched_aas": aln["matched_aas"],
+                "matched_query_positions": str(aln["matched_positions"]),
+                "alignment_str": aln["alignment_str"],
+            }
+            if r.get("extra_cols"):
+                row.update(r["extra_cols"])
+            rows.append(row)
+
+    if not rows:
+        print("  No matches to save.")
+        return
+
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"\n  Results saved to: {out_path}")
+
+
+
+def save_results_txt(results: list[dict], out_path: str, query: str, min_len: int, top_n: int, total_peptides: int = 0):
+    """Write the same formatted output as the terminal display to a .txt file."""
+    import io, sys
+    # Capture print_results output by temporarily redirecting stdout
+    old_stdout = sys.stdout
+    sys.stdout = buffer = io.StringIO()
+    try:
+        print_results(query, results, min_len, top_n)
+        print_summary(query, results, total_peptides)
+    finally:
+        sys.stdout = old_stdout
+    text = buffer.getvalue()
+    with open(out_path, "w") as f:
+        f.write(f"Cyclic Peptide Search Results\n")
+        f.write(f"Query        : {query}\n")
+        f.write(f"Min anchor   : {min_len} AA\n")
+        f.write(f"Hits found   : {len(results)}\n")
+        f.write("=" * 72 + "\n\n")
+        f.write(text)
+    print(f"\n  Results saved to: {out_path}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Search cyclic peptides for anchored positional similarity to a query sequence."
+    )
+    parser.add_argument("--query",      required=True,
+                        help="Query amino acid sequence (single-letter codes)")
+    parser.add_argument("--excel",      required=True,
+                        help="Path to CSV or Excel file containing cyclic peptides")
+    parser.add_argument("--col",        default=None,
+                        help="Column name for sequences (auto-detected if omitted)")
+    parser.add_argument("--sheet",      default=None,
+                        help="Sheet name or index for Excel files (default: first sheet)")
+    parser.add_argument("--min-len",    type=int, default=2, dest="min_len",
+                        help="Minimum anchor (contiguous match) length in AA (default: 2)")
+    parser.add_argument("--top",        type=int, default=0,
+                        help="Show only top N results by best alignment score (default: all)")
+    parser.add_argument("--extra-cols", nargs="*", dest="extra_cols", default=[],
+                        help="Additional columns from the file to include in output")
+    parser.add_argument("--out",        default=None,
+                        help="Optional output path: .csv for tabular data, .txt for formatted alignment report")
+    args = parser.parse_args()
+
+    query = args.query.upper().replace(" ", "")
+    print(f"\nLoading peptides from: {args.excel}")
+    df, seq_col, name_col = load_peptides(args.excel, args.sheet, args.col)
+    print(f"  Loaded {len(df)} rows.")
+
+    extra_cols = [ec for ec in (args.extra_cols or []) if ec in df.columns]
+    missing = [ec for ec in (args.extra_cols or []) if ec not in df.columns]
+    if missing:
+        print(f"  WARNING: Extra columns not found, skipping: {missing}")
+
+    print(f"\nSearching (min anchor = {args.min_len} AA, anchored positional similarity enabled) ...")
+
+    results = []
+    total_peptides = 0
+    for idx, row in df.iterrows():
+        raw = row[seq_col]
+        if pd.isna(raw):
+            continue
+        peptide = str(raw).upper().strip().replace(" ", "")
+        if not peptide:
+            continue
+        total_peptides += 1
+
+        alignments = find_all_alignments(query, peptide, args.min_len)
+        if alignments:
+            results.append({
+                "peptide": peptide,
+                "name": str(row[name_col]).strip() if name_col else "",
+                "row": idx + 2,
+                "best_n_matched": alignments[0]["n_matched"],
+                "alignments": alignments,
+                "extra_cols": {ec: row[ec] for ec in extra_cols},
+            })
+
+    # Sort peptides by best alignment score
+    results.sort(key=lambda r: -r["best_n_matched"])
+
+    print(f"  Found {len(results)} peptides with at least one anchored alignment.")
+    print_results(query, results, args.min_len, args.top)
+    print_summary(query, results, total_peptides)
+
+    if args.out:
+        ext = args.out.lower().rsplit(".", 1)[-1]
+        if ext == "txt":
+            save_results_txt(results, args.out, query, args.min_len, args.top, total_peptides)
+        else:
+            save_results_csv(results, args.out, query)
+
+
+if __name__ == "__main__":
+    main()
