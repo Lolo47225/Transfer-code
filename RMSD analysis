@@ -1,0 +1,1082 @@
+"""
+rmsd_analysis.py
+================
+Post-Job2 RMSD analysis pipeline for cyclic peptide binder design.
+Compares AlphaFold3 predicted structures (.cif) against the original
+RFdiffusion backbone designs (.pdb).
+
+TWO METRICS ARE REPORTED:
+  1. binder_shape_rmsd    — Superpose chain B to chain B, measure RMSD.
+                            Answers: does the peptide fold the same way?
+
+  2. binding_site_rmsd    — Superpose chain A (KRAS) to chain A, then
+                            measure chain B RMSD in that aligned frame.
+                            Answers: is the binder sitting in the same
+                            location on KRAS as designed? (PRIMARY METRIC)
+
+CHAIN CONVENTION:
+    Chain A = KRAS target
+    Chain B = cyclic peptide binder
+
+University of Leeds - Aire HPC
+Usage:
+    python rmsd_analysis.py \
+        --backbones    /path/to/rfdiffusion/backbones \
+        --af3_dir      /path/to/alphafold3/complex \
+        --output       ./rmsd_results \
+        --af3_summary  /path/to/af3_summary.csv \
+        [--threshold 2.0] [--top_n 10] \
+        [--binder_chain B] [--target_chain A]
+"""
+
+import os
+import re
+import sys
+import argparse
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Default chain assignments
+# ---------------------------------------------------------------------------
+DEFAULT_BINDER_CHAIN = "B"
+DEFAULT_TARGET_CHAIN = "A"
+
+# ---------------------------------------------------------------------------
+# 3-letter -> 1-letter amino acid code map (standard + a few common
+# non-canonical/cyclic-peptide residues; unrecognised residues become 'X')
+# ---------------------------------------------------------------------------
+THREE_TO_ONE = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+    "MSE": "M", "SEC": "U", "PYL": "O",
+}
+
+# ---------------------------------------------------------------------------
+# Optional progress bar
+# ---------------------------------------------------------------------------
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+
+# ===========================================================================
+# PDB parsing (chain-aware)
+# ===========================================================================
+
+def get_pdb_chains(pdb_path: str) -> list:
+    chains = set()
+    with open(pdb_path) as fh:
+        for line in fh:
+            if line.startswith(("ATOM", "HETATM")):
+                chains.add(line[21])
+    return sorted(chains)
+
+
+def parse_pdb_ca(pdb_path: str, chain: str) -> np.ndarray:
+    """Cα coordinates (N×3) for a specific chain from a PDB file."""
+    coords = []
+    with open(pdb_path) as fh:
+        for line in fh:
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            if line[12:16].strip() != "CA":
+                continue
+            if line[21] != chain:
+                continue
+            coords.append([float(line[30:38]),
+                           float(line[38:46]),
+                           float(line[46:54])])
+    if not coords:
+        present = get_pdb_chains(pdb_path)
+        raise ValueError(
+            f"No Cα atoms for chain '{chain}' in {pdb_path}. "
+            f"Chains present: {present}."
+        )
+    return np.array(coords, dtype=float)
+
+
+# ===========================================================================
+# CIF parsing (chain-aware)
+# ===========================================================================
+
+def get_cif_chains(cif_path: str) -> list:
+    chains = set()
+    col_map = {}
+    col_idx = 0
+    in_loop = False
+    collecting = False
+    with open(cif_path) as fh:
+        for raw in fh:
+            s = raw.strip()
+            if s == "loop_":
+                in_loop = True; collecting = True
+                col_map = {}; col_idx = 0
+                continue
+            if in_loop and collecting:
+                if s.startswith("_atom_site."):
+                    col_map[s.split(".")[-1]] = col_idx; col_idx += 1
+                    continue
+                else:
+                    collecting = False
+            if in_loop and not collecting and col_map:
+                if s.startswith("_") or s in ("loop_", "#", ""):
+                    break
+                parts = s.split()
+                cc = col_map.get("auth_asym_id", col_map.get("label_asym_id", None))
+                if cc is not None and len(parts) > cc:
+                    chains.add(parts[cc])
+    return sorted(chains)
+
+
+def parse_cif_ca(cif_path: str, chain: str) -> np.ndarray:
+    """Cα coordinates (N×3) for a specific chain from an AF3 CIF file."""
+    coords = []
+    col_map = {}
+    col_idx = 0
+    in_loop = False
+    collecting = False
+
+    with open(cif_path) as fh:
+        for raw in fh:
+            s = raw.strip()
+            if s == "loop_":
+                in_loop = True; collecting = True
+                col_map = {}; col_idx = 0
+                continue
+            if in_loop and collecting:
+                if s.startswith("_atom_site."):
+                    col_map[s.split(".")[-1]] = col_idx; col_idx += 1
+                    continue
+                else:
+                    collecting = False
+            if in_loop and not collecting and col_map:
+                if s.startswith("_") or s in ("loop_", "#", ""):
+                    in_loop = False; col_map = {}
+                    continue
+                parts = s.split()
+                if len(parts) < col_idx:
+                    continue
+                try:
+                    atom_col  = col_map.get("label_atom_id",
+                                col_map.get("auth_atom_id",  None))
+                    chain_col = col_map.get("auth_asym_id",
+                                col_map.get("label_asym_id", None))
+                    if None in (atom_col, chain_col):
+                        continue
+                    if parts[atom_col] != "CA":
+                        continue
+                    if parts[chain_col] != chain:
+                        continue
+                    coords.append([float(parts[col_map["Cartn_x"]]),
+                                   float(parts[col_map["Cartn_y"]]),
+                                   float(parts[col_map["Cartn_z"]])])
+                except (KeyError, ValueError, IndexError):
+                    continue
+
+    if not coords:
+        present = get_cif_chains(cif_path)
+        raise ValueError(
+            f"No Cα atoms for chain '{chain}' in {cif_path}. "
+            f"Chains present: {present}. Check --binder_chain / --target_chain."
+        )
+    return np.array(coords, dtype=float)
+
+
+def parse_cif_sequence(cif_path: str, chain: str) -> str:
+    """
+    One-letter amino acid sequence (N-to-C, in residue order) for a
+    specific chain, read directly from the AF3 CIF atom_site loop.
+
+    Reading straight from the predicted structure (rather than relying
+    on an external summary CSV) means the sequence always matches the
+    exact model that was actually analysed for RMSD.
+    """
+    residues = []  # list of (seq_id, one_letter_code), de-duplicated by seq_id
+    seen_seq_ids = set()
+    col_map = {}
+    col_idx = 0
+    in_loop = False
+    collecting = False
+
+    with open(cif_path) as fh:
+        for raw in fh:
+            s = raw.strip()
+            if s == "loop_":
+                in_loop = True; collecting = True
+                col_map = {}; col_idx = 0
+                continue
+            if in_loop and collecting:
+                if s.startswith("_atom_site."):
+                    col_map[s.split(".")[-1]] = col_idx; col_idx += 1
+                    continue
+                else:
+                    collecting = False
+            if in_loop and not collecting and col_map:
+                if s.startswith("_") or s in ("loop_", "#", ""):
+                    in_loop = False; col_map = {}
+                    continue
+                parts = s.split()
+                if len(parts) < col_idx:
+                    continue
+                try:
+                    atom_col   = col_map.get("label_atom_id",
+                                 col_map.get("auth_atom_id",  None))
+                    chain_col  = col_map.get("auth_asym_id",
+                                 col_map.get("label_asym_id", None))
+                    comp_col   = col_map.get("label_comp_id",
+                                 col_map.get("auth_comp_id",  None))
+                    seqid_col  = col_map.get("label_seq_id",
+                                 col_map.get("auth_seq_id",   None))
+                    if None in (atom_col, chain_col, comp_col, seqid_col):
+                        continue
+                    if parts[atom_col] != "CA":
+                        continue
+                    if parts[chain_col] != chain:
+                        continue
+                    seq_id = parts[seqid_col]
+                    if seq_id in seen_seq_ids:
+                        continue
+                    seen_seq_ids.add(seq_id)
+                    code = THREE_TO_ONE.get(parts[comp_col].upper(), "X")
+                    # seq_id may not be purely numeric in rare cases; fall
+                    # back to append order if it can't be sorted numerically
+                    try:
+                        residues.append((int(seq_id), code))
+                    except ValueError:
+                        residues.append((len(residues), code))
+                except (KeyError, ValueError, IndexError):
+                    continue
+
+    residues.sort(key=lambda x: x[0])
+    return "".join(code for _, code in residues)
+
+
+# ===========================================================================
+# RMSD / Kabsch superposition
+# ===========================================================================
+
+def kabsch_rotation(P: np.ndarray, Q: np.ndarray) -> np.ndarray:
+    """
+    Compute the optimal rotation matrix R that minimises RMSD between
+    centred P (reference) and centred Q (mobile).
+    Returns R such that Q_aligned = Q_centred @ R.T
+    """
+    H = Q.T @ P
+    U, S, Vt = np.linalg.svd(H)
+    d = np.linalg.det(Vt.T @ U.T)
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    return R
+
+
+def kabsch_rmsd(P: np.ndarray, Q: np.ndarray) -> float:
+    """
+    Minimum RMSD between P (reference) and Q (mobile) after optimal
+    superposition (Kabsch algorithm).
+    Both arrays must be (N×3).
+    """
+    if P.shape != Q.shape:
+        raise ValueError(f"Shape mismatch: {P.shape} vs {Q.shape}")
+    P_c = P - P.mean(axis=0)
+    Q_c = Q - Q.mean(axis=0)
+    R   = kabsch_rotation(P_c, Q_c)
+    diff = P_c - (Q_c @ R.T)
+    return float(np.sqrt((diff ** 2).sum() / len(P_c)))
+
+
+def receptor_aligned_ligand_rmsd(ref_target:  np.ndarray,
+                                 pred_target: np.ndarray,
+                                 ref_binder:  np.ndarray,
+                                 pred_binder: np.ndarray) -> float:
+    """
+    Receptor-aligned ligand RMSD — the correct metric for assessing
+    whether a binder occupies the same binding site on the target.
+
+    Steps:
+      1. Compute the optimal rotation R and translation t that superimposes
+         pred_target onto ref_target (align KRAS to KRAS).
+      2. Apply that SAME rotation and translation to pred_binder.
+      3. Measure RMSD between ref_binder and the now-aligned pred_binder.
+
+    This answers: "after placing KRAS in the same orientation as the
+    design, where does the AF3 binder end up relative to KRAS?"
+    A low value means the binder is on the correct face of KRAS.
+    """
+    n_target = min(len(ref_target), len(pred_target))
+    n_binder = min(len(ref_binder), len(pred_binder))
+
+    if n_target < 3:
+        raise ValueError(f"Too few KRAS Cα atoms for alignment ({n_target})")
+    if n_binder < 3:
+        raise ValueError(f"Too few binder Cα atoms ({n_binder})")
+
+    ref_t  = ref_target[:n_target]
+    pred_t = pred_target[:n_target]
+
+    # Centroids
+    ref_t_centre  = ref_t.mean(axis=0)
+    pred_t_centre = pred_t.mean(axis=0)
+
+    # Optimal rotation from pred_target onto ref_target
+    R = kabsch_rotation(ref_t  - ref_t_centre,
+                        pred_t - pred_t_centre)
+
+    # Apply the same transform to pred_binder
+    pred_b_aligned = (pred_binder[:n_binder] - pred_t_centre) @ R.T + ref_t_centre
+
+    # RMSD between ref_binder and the receptor-aligned pred_binder
+    ref_b = ref_binder[:n_binder]
+    diff  = ref_b - pred_b_aligned
+    return float(np.sqrt((diff ** 2).sum() / n_binder))
+
+
+# ===========================================================================
+# CIF file collection
+# ===========================================================================
+
+def collect_cif_files(af3_dir: Path, cif_filename: str) -> list:
+    """
+    One CIF per design directory, matched by filename pattern.
+    Returns list of (cif_path, design_dir_name) tuples.
+    """
+    design_dirs = sorted([d for d in af3_dir.iterdir() if d.is_dir()])
+    results = []
+    for design_dir in design_dirs:
+        dir_name = design_dir.name
+        expected = design_dir / f"{dir_name}_model.cif"
+        if expected.exists():
+            results.append((str(expected), dir_name))
+        else:
+            matches = sorted(design_dir.glob(cif_filename))
+            if matches:
+                results.append((str(matches[0]), dir_name))
+            else:
+                print(f"[WARN] No CIF found in {design_dir} "
+                      f"(expected: {expected.name})", file=sys.stderr)
+    return results
+
+
+# ===========================================================================
+# Path utilities
+# ===========================================================================
+
+def extract_design_name(cif_path: str) -> str:
+    """
+    Extract design name from the CIF parent directory name.
+    e.g. .../dir1_noise0_4_..._complex/dir1_..._complex_model.cif
+    → dir1_noise0_4_..._seq01
+    """
+    parent_name = Path(cif_path).parent.name
+    return re.sub(r"_complex$", "", parent_name)
+
+
+def find_backbone_pdb(design_name: str, backbone_dir: str) -> str | None:
+    """Locate the RFdiffusion backbone PDB matching a design name."""
+    bd = Path(backbone_dir)
+
+    exact = bd / f"{design_name}.pdb"
+    if exact.exists():
+        return str(exact)
+
+    candidates = list(bd.glob(f"{design_name}*.pdb"))
+    if candidates:
+        return str(sorted(candidates)[0])
+
+    first_token = design_name.split("_")[0]
+    candidates  = list(bd.glob(f"{first_token}*.pdb"))
+    if candidates:
+        candidates.sort(
+            key=lambda p: len(os.path.commonprefix([p.stem, design_name])),
+            reverse=True)
+        return str(candidates[0])
+
+    return None
+
+
+# ===========================================================================
+# Core pair analysis
+# ===========================================================================
+
+def analyse_pair(backbone_pdb: str,
+                 af3_cif:      str,
+                 binder_chain: str,
+                 target_chain: str) -> dict:
+    """
+    Compute the two key RMSD metrics for one AF3 prediction vs its backbone.
+
+    Returns:
+        binder_shape_rmsd   — Kabsch RMSD of chain B onto chain B.
+                              Measures peptide conformation similarity.
+
+        binding_site_rmsd   — Receptor-aligned ligand RMSD.
+                              Superimposes KRAS (chain A) onto KRAS, then
+                              measures where chain B ends up.
+                              PRIMARY METRIC for binding location fidelity.
+
+        binder_sequence     — One-letter peptide sequence of the binder
+                              chain, read directly from the AF3 CIF.
+    """
+    result = dict(
+        binder_shape_rmsd   = None,
+        binding_site_rmsd   = None,
+        binder_sequence     = None,
+        n_ca_binder_ref     = None,
+        n_ca_binder_pred    = None,
+        n_ca_target_ref     = None,
+        n_ca_target_pred    = None,
+        error               = None,
+    )
+
+    try:
+        # Parse binder chain (B)
+        ref_binder  = parse_pdb_ca(backbone_pdb, chain=binder_chain)
+        pred_binder = parse_cif_ca(af3_cif,      chain=binder_chain)
+
+        # Parse target chain (A)
+        ref_target  = parse_pdb_ca(backbone_pdb, chain=target_chain)
+        pred_target = parse_cif_ca(af3_cif,      chain=target_chain)
+
+        result["n_ca_binder_ref"]  = len(ref_binder)
+        result["n_ca_binder_pred"] = len(pred_binder)
+        result["n_ca_target_ref"]  = len(ref_target)
+        result["n_ca_target_pred"] = len(pred_target)
+
+        # --- Peptide sequence, straight from the AF3 model ---
+        try:
+            result["binder_sequence"] = parse_cif_sequence(af3_cif, chain=binder_chain)
+        except Exception:
+            result["binder_sequence"] = None
+
+        # --- Metric 1: Binder shape RMSD ---
+        n_b = min(len(ref_binder), len(pred_binder))
+        if n_b >= 3:
+            result["binder_shape_rmsd"] = round(
+                kabsch_rmsd(ref_binder[:n_b], pred_binder[:n_b]), 4)
+        else:
+            result["error"] = f"Too few binder Cα atoms ({n_b})"
+            return result
+
+        # --- Metric 2: Binding site RMSD (receptor-aligned) ---
+        result["binding_site_rmsd"] = round(
+            receptor_aligned_ligand_rmsd(
+                ref_target, pred_target,
+                ref_binder, pred_binder), 4)
+
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
+
+
+# ===========================================================================
+# Main analysis loop
+# ===========================================================================
+
+def run_analysis(backbone_dir:  str,
+                 af3_dir:       str,
+                 output_dir:    str,
+                 cif_filename:  str   = "*_complex_model.cif",
+                 binder_chain:  str   = DEFAULT_BINDER_CHAIN,
+                 target_chain:  str   = DEFAULT_TARGET_CHAIN,
+                 threshold:     float = 2.0,
+                 top_n:         int   = 10,
+                 af3_summary:   str   = None) -> pd.DataFrame:
+
+    backbone_dir = Path(backbone_dir)
+    af3_dir      = Path(af3_dir)
+    output_dir   = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "per_design").mkdir(exist_ok=True)
+
+    cif_list = collect_cif_files(af3_dir, cif_filename)
+    if not cif_list:
+        print(f"[ERROR] No CIF files found under {af3_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Designs to analyse : {len(cif_list)}")
+    print(f"Binder chain       : {binder_chain}  |  Target chain: {target_chain}")
+    print(f"Promising threshold: binding_site_rmsd < {threshold} Å\n")
+
+    rows = []
+    missing_backbones = set()
+
+    for cif_str, dir_name in tqdm(cif_list, desc="Analysing"):
+        design_name = extract_design_name(cif_str)
+        backbone    = find_backbone_pdb(design_name, str(backbone_dir))
+
+        row = dict(design_name  = design_name,
+                   design_dir   = dir_name,
+                   af3_cif      = cif_str,
+                   backbone_pdb = backbone if backbone else "NOT_FOUND")
+
+        if backbone is None:
+            # Even without a backbone match we can still read off the
+            # sequence directly from the AF3 CIF.
+            try:
+                seq = parse_cif_sequence(cif_str, chain=binder_chain)
+            except Exception:
+                seq = None
+            row.update(binder_shape_rmsd=None, binding_site_rmsd=None,
+                       binder_sequence=seq,
+                       n_ca_binder_ref=None, n_ca_binder_pred=None,
+                       n_ca_target_ref=None, n_ca_target_pred=None,
+                       error="Backbone PDB not found")
+            missing_backbones.add(design_name)
+        else:
+            row.update(analyse_pair(backbone, cif_str, binder_chain, target_chain))
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    # Filter, rank, flag — primary metric is binding_site_rmsd
+    df_valid = df[df["binding_site_rmsd"].notna()].copy()
+    df_valid.sort_values("binding_site_rmsd", inplace=True)
+    df_valid["rank"]      = range(1, len(df_valid) + 1)
+    df_valid["promising"] = df_valid["binding_site_rmsd"] < threshold
+
+    df_hits = df_valid[df_valid["promising"]]
+
+    # -----------------------------------------------------------------------
+    # Output 1: Full ranked RMSD CSV
+    # -----------------------------------------------------------------------
+    cols = ["rank", "design_name", "design_dir", "binder_sequence",
+            "binding_site_rmsd", "binder_shape_rmsd",
+            "n_ca_binder_ref", "n_ca_binder_pred",
+            "n_ca_target_ref", "n_ca_target_pred",
+            "promising", "backbone_pdb", "af3_cif", "error"]
+    df_out = df_valid[[c for c in cols if c in df_valid.columns]]
+    all_csv = output_dir / "all_rmsd_results.csv"
+    df_out.to_csv(all_csv, index=False)
+    print(f"[✓] Full RMSD results    → {all_csv}")
+
+    # -----------------------------------------------------------------------
+    # Output 2: Promising hits CSV
+    # -----------------------------------------------------------------------
+    # promising_hits.csv written later after AF3 merge so sequence is included
+
+    # -----------------------------------------------------------------------
+    # Output 3: Per-design CSVs
+    # -----------------------------------------------------------------------
+    for design, group in df_valid.groupby("design_name"):
+        safe = re.sub(r"[^\w\-]", "_", design)
+        group.sort_values("binding_site_rmsd").to_csv(
+            output_dir / "per_design" / f"{safe}.csv", index=False)
+
+    # -----------------------------------------------------------------------
+    # Output 4: Combined summary CSV (RMSD merged with AF3 scores)
+    # -----------------------------------------------------------------------
+    combined_csv_path = output_dir / "combined_summary.csv"
+    combined_df = df_valid.copy()
+
+    if af3_summary and Path(af3_summary).exists():
+        try:
+            af3_df = pd.read_csv(af3_summary)
+            print(f"[INFO] AF3 summary loaded: {len(af3_df)} rows")
+            print(f"[INFO] AF3 columns: {list(af3_df.columns)}")
+
+            # Find the join column — 'job' is the standard name in this pipeline
+            match_col = None
+            for candidate in ["job", "design_name", "name", "description",
+                               "sequence_name", "complex_name", "id"]:
+                if candidate in af3_df.columns:
+                    match_col = candidate
+                    break
+            if match_col is None:
+                str_cols = af3_df.select_dtypes(include="object").columns.tolist()
+                if str_cols:
+                    match_col = str_cols[0]
+
+            print(f"[INFO] Joining on AF3 column: '{match_col}'")
+            print(f"[INFO] Sample AF3 keys  : {af3_df[match_col].head(3).tolist()}")
+            print(f"[INFO] Sample RMSD keys : {df_valid['design_name'].head(3).tolist()}")
+
+            if match_col:
+                # Normalise both sides — strip _complex suffix and whitespace
+                def normalise(s):
+                    return str(s).replace("_complex", "").strip()
+
+                af3_df["_key"]   = af3_df[match_col].apply(normalise)
+                df_valid["_key"] = df_valid["design_name"].apply(normalise)
+
+                print(f"[INFO] Normalised AF3 keys  : {af3_df['_key'].head(3).tolist()}")
+                print(f"[INFO] Normalised RMSD keys : {df_valid['_key'].head(3).tolist()}")
+
+                matched = df_valid["_key"].isin(af3_df["_key"]).sum()
+                print(f"[INFO] Keys matched: {matched} / {len(df_valid)}")
+
+                if matched == 0:
+                    print("[WARN] No keys matched between RMSD results and AF3 summary.")
+                    print("[WARN] Check that the 'job' column in af3_summary.csv matches")
+                    print("[WARN] the RFdiffusion output directory names.")
+                else:
+                    # If the AF3 summary also carries its own 'sequence' column,
+                    # keep the RMSD-side one (parsed straight from the analysed
+                    # CIF) as the source of truth and drop the AF3-side duplicate
+                    # rather than silently overwriting it in the merge.
+                    af3_merge_cols = [c for c in af3_df.columns if c != match_col]
+                    if "sequence" in af3_merge_cols and "binder_sequence" in df_valid.columns:
+                        af3_merge_cols = [c for c in af3_merge_cols if c != "sequence"]
+
+                    combined_df = df_valid.merge(
+                        af3_df[af3_merge_cols + ["_key"]],
+                        on="_key", how="left"
+                    ).drop(columns=["_key"])
+                    df_valid.drop(columns=["_key"], inplace=True, errors="ignore")
+                    combined_df.sort_values("binding_site_rmsd", inplace=True)
+                    print(f"[OK] Merge successful — {matched} rows joined")
+            else:
+                print("[WARN] Could not identify a join column in AF3 summary.")
+
+        except Exception as e:
+            print(f"[WARN] Could not merge AF3 summary: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        if af3_summary:
+            print(f"[WARN] AF3 summary not found at {af3_summary}")
+
+    combined_df.to_csv(combined_csv_path, index=False)
+    print(f"[✓] Combined summary CSV → {combined_csv_path}")
+
+    # Output 2: Promising hits CSV — written here so sequence column is included
+    hits_csv = output_dir / "promising_hits.csv"
+    df_hits_combined = combined_df[combined_df["promising"] == True].copy()
+    # Bring sequence column to front if present (binder_sequence is parsed
+    # straight from the CIF and is always populated; fall back to an
+    # AF3-summary 'sequence' column if for some reason that's the only one present)
+    seq_col_name = "binder_sequence" if "binder_sequence" in df_hits_combined.columns \
+        else ("sequence" if "sequence" in df_hits_combined.columns else None)
+    if seq_col_name:
+        seq_col = df_hits_combined.pop(seq_col_name)
+        df_hits_combined.insert(2, seq_col_name, seq_col)
+    df_hits_combined.to_csv(hits_csv, index=False)
+    print(f"[✓] Promising hits       → {hits_csv}  "
+          f"({len(df_hits_combined)} structure(s) with binding_site_rmsd < {threshold} Å)")
+
+    # -----------------------------------------------------------------------
+    # Output 4b: AF3 summary replicated as Excel with yellow row highlights
+    # -----------------------------------------------------------------------
+    xlsx_path = output_dir / "af3_rmsd_summary.xlsx"
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import PatternFill, Font, Alignment
+        from openpyxl.utils import get_column_letter
+
+        YELLOW = PatternFill("solid", start_color="FFFF00", fgColor="FFFF00")
+        HEADER_FILL = PatternFill("solid", start_color="1F4E79", fgColor="1F4E79")
+        HEADER_FONT = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+        DATA_FONT   = Font(name="Arial", size=10)
+        BOLD_FONT   = Font(name="Arial", size=10, bold=True)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "AF3 + RMSD Results"
+
+        # Sort by ipsae descending (best binders first), matching original AF3 output
+        sort_col = None
+        for candidate in ["ipsae", "ipSAE", "IPSAE", "iptm", "ipTM",
+                          "mean_plddt", "ranking_score"]:
+            if candidate in combined_df.columns:
+                sort_col = candidate
+                break
+
+        if sort_col:
+            display_df = combined_df.sort_values(sort_col, ascending=False).copy()
+        else:
+            display_df = combined_df.copy()
+
+        # Move RMSD columns to sit right after the sort column (ipsae)
+        rmsd_cols_ordered = ["binding_site_rmsd", "binder_shape_rmsd", "promising"]
+        other_cols = [c for c in display_df.columns if c not in rmsd_cols_ordered]
+
+        # Insert RMSD cols after ipsae if present, otherwise at end
+        if sort_col and sort_col in other_cols:
+            insert_at = other_cols.index(sort_col) + 1
+            final_cols = (other_cols[:insert_at]
+                          + [c for c in rmsd_cols_ordered if c in display_df.columns]
+                          + other_cols[insert_at:])
+        else:
+            final_cols = other_cols + [c for c in rmsd_cols_ordered if c in display_df.columns]
+
+        display_df = display_df[final_cols]
+
+        # Write header row
+        for col_idx, col_name in enumerate(display_df.columns, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=col_name)
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+            cell.alignment = Alignment(horizontal="center", vertical="center",
+                                       wrap_text=True)
+
+        ws.row_dimensions[1].height = 30
+
+        # Write data rows with yellow highlight for promising
+        for row_idx, (_, row) in enumerate(display_df.iterrows(), start=2):
+            is_promising = bool(row.get("promising", False))
+            for col_idx, col_name in enumerate(display_df.columns, start=1):
+                val = row[col_name]
+                # Convert numpy/pandas types to native Python
+                if hasattr(val, "item"):
+                    val = val.item()
+                if pd.isna(val) if not isinstance(val, str) else False:
+                    val = ""
+                cell = ws.cell(row=row_idx, column=col_idx, value=val)
+                cell.font = BOLD_FONT if is_promising else DATA_FONT
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                if is_promising:
+                    cell.fill = YELLOW
+                # Round floats to 4dp for readability
+                if isinstance(val, float):
+                    cell.number_format = "0.0000"
+
+        # Auto-size columns
+        for col_idx, col_name in enumerate(display_df.columns, start=1):
+            col_letter = get_column_letter(col_idx)
+            max_len = max(
+                len(str(col_name)),
+                *[len(str(display_df.iloc[r][col_name]))
+                  for r in range(min(len(display_df), 50))]
+            )
+            ws.column_dimensions[col_letter].width = min(max(max_len + 2, 10), 40)
+
+        # Freeze the header row
+        ws.freeze_panes = "A2"
+
+        # Add a note in a second sheet explaining the metrics
+        ws2 = wb.create_sheet("Metric Definitions")
+        definitions = [
+            ["Metric", "Definition", "Range / Good Values"],
+
+            # --- RMSD metrics ---
+            ["── RMSD METRICS ──", "", ""],
+            ["binding_site_rmsd",
+             "PRIMARY RMSD METRIC. Superimposes AF3 KRAS (chain A) onto the "
+             "RFdiffusion backbone KRAS, then measures where the binder (chain B) "
+             "lands in that aligned frame. Answers: is the binder sitting on the "
+             "correct face of KRAS as designed? Low = correct binding location.",
+             f"Promising < {threshold} Å. Excellent < 2 Å"],
+            ["binder_shape_rmsd",
+             "SECONDARY RMSD METRIC. Superimposes AF3 binder (chain B) directly "
+             "onto the backbone binder. Answers: does the peptide fold into the "
+             "same conformation as designed? Independent of binding location.",
+             "Excellent < 1 Å. Good < 2 Å"],
+            ["promising",
+             f"TRUE if binding_site_rmsd < {threshold} Å. "
+             "Rows marked TRUE are highlighted yellow in the main sheet.",
+             "TRUE / FALSE"],
+
+            # --- AF3 confidence metrics ---
+            ["── AF3 CONFIDENCE METRICS ──", "", ""],
+            ["ipsae",
+             "Interface Predicted Structure Alignment Error. Measures the "
+             "predicted alignment error specifically at the binding interface "
+             "between the binder and KRAS. The primary AF3 metric for assessing "
+             "binding confidence — lower error = more confident the interface "
+             "geometry is correct. Sheet is sorted by this column descending.",
+             "Lower is better. < 10 strong. < 15 moderate."],
+            ["ipsae_d0chn",
+             "ipSAE normalised using d0 calculated per chain length. A "
+             "chain-length-normalised version of ipsae that allows fairer "
+             "comparison between binders of different sizes.",
+             "Lower is better"],
+            ["ipsae_d0dom",
+             "ipSAE normalised using d0 calculated per domain. Similar to "
+             "ipsae_d0chn but uses domain-level normalisation. Useful when "
+             "comparing across structurally distinct binder classes.",
+             "Lower is better"],
+            ["complex_iptm",
+             "Interface predicted TM-score for the full complex. Measures "
+             "confidence in the relative orientation of the two chains. "
+             "Higher = more confident the binder and KRAS are correctly "
+             "positioned relative to each other.",
+             "0-1. > 0.8 excellent. > 0.6 acceptable"],
+            ["complex_ptm",
+             "Predicted TM-score for the full complex structure overall. "
+             "Global confidence metric across both chains combined.",
+             "0-1. Higher is better"],
+            ["complex_ranking_score",
+             "AF3 composite ranking score for the complex prediction. Weighted "
+             "combination of ptm and iptm used internally by AF3 to rank "
+             "multiple predictions of the same sequence.",
+             "Higher is better"],
+            ["complex_frac_disordered",
+             "Fraction of residues in the complex predicted to be disordered "
+             "(low pLDDT). High values suggest the binder may not adopt a "
+             "stable fold when bound to KRAS.",
+             "Lower is better. < 0.1 good"],
+            ["apo_ptm",
+             "Predicted TM-score for the binder alone (apo = unbound state). "
+             "Measures confidence in the binder's intrinsic fold independent "
+             "of KRAS. Cyclic peptides should have moderate-high apo_ptm if "
+             "they are pre-organised for binding.",
+             "0-1. Higher is better"],
+            ["apo_ranking_score",
+             "AF3 composite ranking score for the binder in its apo (unbound) "
+             "state. Higher = more confident in the binder's standalone fold.",
+             "Higher is better"],
+            ["apo_frac_disordered",
+             "Fraction of binder residues predicted to be disordered in the "
+             "apo state. For cyclic peptides this should ideally be low, "
+             "indicating the peptide has a stable conformation before engaging KRAS.",
+             "Lower is better. < 0.1 good"],
+            ["pdockq",
+             "Predicted DockQ score. Estimates the quality of the docked "
+             "complex on a 0-1 scale, combining interface contacts and "
+             "geometry. Derived from the AF3 pLDDT at the interface.",
+             "0-1. > 0.23 acceptable. > 0.49 medium. > 0.80 high"],
+            ["pdockq2",
+             "Updated version of pDockQ (pDockQ2) with improved calibration "
+             "for AF2/AF3 predictions. Generally more reliable than pdockq "
+             "for ranking binding quality.",
+             "0-1. Higher is better. > 0.15 promising"],
+            ["lis",
+             "Local Interaction Score. Measures the predicted quality of "
+             "local contacts at the binding interface. Sensitive to interface "
+             "packing and complementarity between the binder and KRAS surface.",
+             "Higher is better"],
+            ["n_samples",
+             "Number of AF3 predictions generated for this sequence. "
+             "The best-scoring model (by complex_ranking_score) was used "
+             "for RMSD analysis.",
+             "Typically 5 or 20"],
+            ["binder_sequence",
+             "Amino acid sequence of the cyclic peptide binder (chain B), "
+             "read directly from the AF3 CIF model that was analysed.",
+             ""],
+            ["job",
+             "Job/design identifier linking back to the CyclicMPNN sequence "
+             "generation run.",
+             ""],
+        ]
+        for r_idx, row_data in enumerate(definitions, start=1):
+            for c_idx, val in enumerate(row_data, start=1):
+                cell = ws2.cell(row=r_idx, column=c_idx, value=val)
+                if r_idx == 1:
+                    cell.fill = HEADER_FILL
+                    cell.font = HEADER_FONT
+                else:
+                    cell.font = DATA_FONT
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws2.column_dimensions["A"].width = 25
+        ws2.column_dimensions["B"].width = 90
+        ws2.column_dimensions["C"].width = 35
+
+        # Style the section header rows
+        from openpyxl.styles import Font as XLFont, PatternFill as XLFill
+        SECTION_FILL = PatternFill("solid", start_color="D9E1F2", fgColor="D9E1F2")
+        SECTION_FONT = Font(bold=True, name="Arial", size=10)
+        for row in ws2.iter_rows():
+            if row[0].value and str(row[0].value).startswith("──"):
+                for cell in row:
+                    cell.fill = SECTION_FILL
+                    cell.font = SECTION_FONT
+
+        wb.save(str(xlsx_path))
+        print(f"[✓] Excel summary        → {xlsx_path}")
+
+    except ImportError:
+        print("[WARN] openpyxl not installed — skipping Excel output.")
+        print("[WARN] Install with: pip install --user openpyxl")
+
+    # -----------------------------------------------------------------------
+    # Output 5: Human-readable combined summary TXT
+    # -----------------------------------------------------------------------
+    combined_txt_path = output_dir / "combined_summary.txt"
+
+    # Identify AF3 score columns (everything not from the RMSD pipeline)
+    rmsd_cols = {"rank", "design_name", "design_dir", "af3_cif", "backbone_pdb",
+                 "binding_site_rmsd", "binder_shape_rmsd", "binder_sequence",
+                 "promising", "error",
+                 "n_ca_binder_ref", "n_ca_binder_pred",
+                 "n_ca_target_ref", "n_ca_target_pred", "_key"}
+    af3_score_cols = [c for c in combined_df.columns if c not in rmsd_cols]
+
+    with open(combined_txt_path, "w") as fh:
+        fh.write("=" * 75 + "\n")
+        fh.write("  CYCLIC PEPTIDE BINDER — COMBINED AF3 + RMSD RESULTS\n")
+        fh.write("=" * 75 + "\n\n")
+        fh.write(f"AF3 directory      : {af3_dir}\n")
+        fh.write(f"Backbone dir       : {backbone_dir}\n")
+        fh.write(f"AF3 summary CSV    : {af3_summary or 'not provided'}\n")
+        fh.write(f"Binder chain       : {binder_chain}  |  Target chain: {target_chain}\n")
+        fh.write(f"Promising threshold: binding_site_rmsd < {threshold} Å\n\n")
+        fh.write(f"Designs evaluated  : {len(df)}\n")
+        fh.write(f"Successfully scored: {len(df_valid)}\n")
+        fh.write(f"Promising hits     : {len(df_hits)}\n\n")
+
+        fh.write("METRIC DEFINITIONS\n")
+        fh.write("-" * 75 + "\n")
+        fh.write(
+            "  binding_site_rmsd  (PRIMARY) — KRAS-aligned binder RMSD.\n"
+            "    Superimposes AF3 KRAS onto backbone KRAS, then measures\n"
+            "    where the binder lands. Low = binder on correct face of KRAS.\n\n"
+            "  binder_shape_rmsd  (SECONDARY) — Binder-on-binder RMSD.\n"
+            "    Superimposes AF3 binder directly onto backbone binder.\n"
+            "    Low = peptide folds into the same conformation as designed.\n\n"
+        )
+
+        fh.write("=" * 75 + "\n")
+        fh.write(f"ALL DESIGNS — RANKED BY binding_site_rmsd\n")
+        fh.write("=" * 75 + "\n\n")
+
+        for _, r in combined_df.iterrows():
+            flag = "  *** PROMISING ***" if r.get("promising") else ""
+            rank = int(r["rank"]) if pd.notna(r.get("rank")) else "?"
+            fh.write(f"  Rank {rank:>4}  {r['design_name']}{flag}\n")
+            fh.write(f"  {'─' * 65}\n")
+
+            seq = r.get("binder_sequence")
+            if pd.notna(seq) and seq:
+                fh.write(f"  SEQUENCE: {seq}\n")
+
+            # RMSD scores
+            fh.write(f"  RMSD SCORES:\n")
+            bs  = r.get("binding_site_rmsd")
+            bsh = r.get("binder_shape_rmsd")
+            fh.write(f"    binding_site_rmsd  : "
+                     f"{bs:.3f} Å  ← PRIMARY\n" if pd.notna(bs)
+                     else "    binding_site_rmsd  : N/A\n")
+            fh.write(f"    binder_shape_rmsd  : "
+                     f"{bsh:.3f} Å\n" if pd.notna(bsh)
+                     else "    binder_shape_rmsd  : N/A\n")
+
+            # AF3 confidence scores
+            if af3_score_cols:
+                fh.write(f"  AF3 SCORES:\n")
+                for col in af3_score_cols:
+                    val = r.get(col)
+                    if pd.isna(val):
+                        continue
+                    if isinstance(val, float):
+                        fh.write(f"    {col:<28}: {val:.4f}\n")
+                    else:
+                        fh.write(f"    {col:<28}: {val}\n")
+
+            if pd.notna(r.get("error")) and r["error"]:
+                fh.write(f"  ERROR: {r['error']}\n")
+            fh.write("\n")
+
+        # Statistics section
+        fh.write("=" * 75 + "\n")
+        fh.write("STATISTICS\n")
+        fh.write("=" * 75 + "\n")
+        for metric, label in [
+            ("binding_site_rmsd", "Binding site RMSD (PRIMARY)"),
+            ("binder_shape_rmsd", "Binder shape RMSD"),
+        ]:
+            col = df_valid[metric].dropna()
+            if col.empty:
+                continue
+            fh.write(f"\n  {label}:\n")
+            fh.write(f"    min    = {col.min():.3f} Å\n")
+            fh.write(f"    mean   = {col.mean():.3f} Å\n")
+            fh.write(f"    median = {col.median():.3f} Å\n")
+            fh.write(f"    max    = {col.max():.3f} Å\n")
+
+    print(f"[✓] Combined summary TXT → {combined_txt_path}")
+
+    # -----------------------------------------------------------------------
+    # Output 6: Human-readable RMSD-only summary
+    # -----------------------------------------------------------------------
+    summary_path = output_dir / "rmsd_summary.txt"
+    with open(summary_path, "w") as fh:
+        fh.write("=" * 75 + "\n")
+        fh.write("  CYCLIC PEPTIDE BINDER — RMSD ANALYSIS SUMMARY\n")
+        fh.write("=" * 75 + "\n\n")
+        fh.write(f"AF3 directory      : {af3_dir}\n")
+        fh.write(f"Backbone dir       : {backbone_dir}\n")
+        fh.write(f"Binder chain       : {binder_chain}  |  Target chain: {target_chain}\n")
+        fh.write(f"Promising threshold: binding_site_rmsd < {threshold} Å\n\n")
+        fh.write(f"Designs evaluated  : {len(df)}\n")
+        fh.write(f"Successfully scored: {len(df_valid)}\n")
+        fh.write(f"Promising hits     : {len(df_hits)}\n\n")
+
+        if missing_backbones:
+            fh.write("WARNING — No backbone PDB matched for:\n")
+            for d in sorted(missing_backbones):
+                fh.write(f"  {d}\n")
+            fh.write("\n")
+
+        fh.write("-" * 75 + "\n")
+        fh.write(f"TOP {top_n} BY binding_site_rmsd\n")
+        fh.write("-" * 75 + "\n")
+        for _, r in df_valid.head(top_n).iterrows():
+            flag = "  *** PROMISING ***" if r.get("promising") else ""
+            fh.write(f"\n  Rank {int(r['rank']):>4}  {r['design_name']}{flag}\n")
+            seq = r.get("binder_sequence")
+            if pd.notna(seq) and seq:
+                fh.write(f"    sequence          : {seq}\n")
+            bs  = r.get("binding_site_rmsd")
+            bsh = r.get("binder_shape_rmsd")
+            fh.write(f"    binding_site_rmsd : "
+                     f"{bs:.3f} Å  ← PRIMARY\n" if pd.notna(bs)
+                     else "    binding_site_rmsd : N/A\n")
+            fh.write(f"    binder_shape_rmsd : "
+                     f"{bsh:.3f} Å\n" if pd.notna(bsh)
+                     else "    binder_shape_rmsd : N/A\n")
+
+        fh.write("\n" + "-" * 75 + "\n")
+        fh.write("STATISTICS\n")
+        fh.write("-" * 75 + "\n")
+        for metric, label in [
+            ("binding_site_rmsd", "Binding site RMSD (PRIMARY)"),
+            ("binder_shape_rmsd", "Binder shape RMSD"),
+        ]:
+            col = df_valid[metric].dropna()
+            if col.empty:
+                continue
+            fh.write(f"\n  {label}:\n")
+            fh.write(f"    min    = {col.min():.3f} Å\n")
+            fh.write(f"    mean   = {col.mean():.3f} Å\n")
+            fh.write(f"    median = {col.median():.3f} Å\n")
+            fh.write(f"    max    = {col.max():.3f} Å\n")
+
+    print(f"[✓] RMSD summary         → {summary_path}")
+    if missing_backbones:
+        print(f"\n[!] {len(missing_backbones)} design(s) had no matching backbone PDB.")
+
+    return df_valid
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Compare AF3 predictions to RFdiffusion backbones via RMSD.")
+    p.add_argument("--backbones",    required=True)
+    p.add_argument("--af3_dir",      required=True)
+    p.add_argument("--output",       default="./rmsd_results")
+    p.add_argument("--threshold",    type=float, default=11.0,
+                   help="binding_site_rmsd threshold for 'promising' flag (default: 2.0 Å)")
+    p.add_argument("--top_n",        type=int,   default=10)
+    p.add_argument("--binder_chain", default=DEFAULT_BINDER_CHAIN)
+    p.add_argument("--target_chain", default=DEFAULT_TARGET_CHAIN)
+    p.add_argument("--cif_filename", default="*_complex_model.cif")
+    p.add_argument("--af3_summary",  default=None,
+                   help="Path to Job2 AF3 summary CSV to merge with RMSD scores")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    df = run_analysis(
+        backbone_dir = args.backbones,
+        af3_dir      = args.af3_dir,
+        output_dir   = args.output,
+        cif_filename = args.cif_filename,
+        binder_chain = args.binder_chain,
+        target_chain = args.target_chain,
+        threshold    = args.threshold,
+        top_n        = args.top_n,
+        af3_summary  = args.af3_summary,
+    )
+    n = int(df["promising"].sum()) if "promising" in df.columns else 0
+    print(f"\nDone. {n} promising hit(s). See {args.output}/")
