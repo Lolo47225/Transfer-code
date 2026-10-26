@@ -1,0 +1,169 @@
+#!/bin/bash
+#SBATCH --job-name=rmsd_analysis
+#SBATCH --partition=standard
+#SBATCH --time=02:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --output=logs/rmsd_analysis_%j.out
+#SBATCH --error=logs/rmsd_analysis_%j.err
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=gpsl0084@leeds.ac.uk
+
+# ============================================================
+#  RMSD Analysis — best AF3 model vs RFdiffusion backbones
+#  Run after Job1 (RFdiffusion) and Job2 (CyclicMPNN + AF3)
+# ============================================================
+
+set -euo pipefail
+
+# ------------------------------------------------------------
+# EDIT THESE PATHS TO MATCH YOUR PIPELINE
+# ------------------------------------------------------------
+
+# RFdiffusion backbone PDBs (output of Job1)
+BACKBONE_DIR="/mnt/scratch/gpsl0084/RFdiffusion/scripts/outputs/kras_scaffold_k3"
+
+# AlphaFold3 complex predictions root (output of Job2)
+AF3_DIR="/mnt/scratch/gpsl0084/binders/kras_binders/kras_scaffold_k3_0.1/alphafold3/complex"
+
+# Job2 AF3 summary CSV — RMSD scores will be merged into this file
+AF3_SUMMARY="$(dirname "${AF3_DIR}")/af3_summary.csv"
+
+# Where results will be writtentemp_test/temp_test_0.1/
+OUTPUT_DIR="/mnt/scratch/gpsl0084/binders/kras_binders/kras_scaffold_k3_0.1/rmsd_results/$(date +%Y%m%d_%H%M%S)"
+
+# RMSD threshold in Å — structures below this are flagged as promising
+RMSD_THRESHOLD=11.0
+
+# How many top hits to show in the human-readable summary
+TOP_N=20
+
+# Filename pattern of the best-scoring CIF inside each design directory.
+# Job2 writes one top-model CIF directly into each design folder.
+# e.g. dir1_noise0_4_20260518_100145_0_seq01_complex_model.cif
+CIF_FILENAME="*_complex_model.cif"
+
+# Path to the Job2 AF3 summary CSV — RMSD scores will be merged into this
+# AF3 summary CSV — derived automatically from AF3_DIR so it always
+# points to the correct location regardless of temperature/group.
+
+# Path to the Python analysis script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_SCRIPT="${SCRIPT_DIR}/rmsd_analysis.py"
+
+# ------------------------------------------------------------
+# Environment setup
+# ------------------------------------------------------------
+
+echo "========================================================"
+echo "  RMSD Analysis Pipeline"
+echo "  Job ID   : ${SLURM_JOB_ID:-local}"
+echo "  Node     : $(hostname)"
+echo "  Started  : $(date)"
+echo "========================================================"
+
+mkdir -p logs
+mkdir -p "${OUTPUT_DIR}"
+
+# --- Python interpreter — conda environment ---
+PYTHON_BIN="${HOME}/miniconda3/envs/peptide_rmsd/bin/python"
+
+if [ ! -f "${PYTHON_BIN}" ]; then
+    echo "[ERROR] Conda env Python not found at: ${PYTHON_BIN}"
+    echo "[ERROR] Rebuild the environment with:"
+    echo "[ERROR]   conda create -n peptide_rmsd python=3.11 numpy pandas tqdm openpyxl -y"
+    exit 1
+fi
+echo "[INFO] Python: ${PYTHON_BIN} ($(${PYTHON_BIN} --version 2>&1))"
+
+# ------------------------------------------------------------
+# Validate inputs
+# ------------------------------------------------------------
+
+echo ""
+echo "[INFO] Backbone PDB directory : ${BACKBONE_DIR}"
+echo "[INFO] AF3 output directory   : ${AF3_DIR}"
+echo "[INFO] Results output         : ${OUTPUT_DIR}"
+echo "[INFO] RMSD threshold         : ${RMSD_THRESHOLD} Å"
+echo "[INFO] CIF target file        : ${CIF_FILENAME}"
+echo "[INFO] AF3 summary CSV        : ${AF3_SUMMARY}"
+echo ""
+
+if [ ! -d "${BACKBONE_DIR}" ]; then
+    echo "[ERROR] Backbone directory not found: ${BACKBONE_DIR}"
+    exit 1
+fi
+
+if [ ! -d "${AF3_DIR}" ]; then
+    echo "[ERROR] AF3 directory not found: ${AF3_DIR}"
+    exit 1
+fi
+
+N_BACKBONES=$(find "${BACKBONE_DIR}" -name "*.pdb" | wc -l)
+N_DESIGNS=$(find "${AF3_DIR}" -mindepth 1 -maxdepth 1 -type d | wc -l)
+N_CIFS=$(find "${AF3_DIR}" -mindepth 2 -maxdepth 2 -name "${CIF_FILENAME}" | wc -l)
+
+echo "[INFO] Found ${N_BACKBONES} backbone PDB(s)"
+echo "[INFO] Found ${N_DESIGNS} design director(ies) | ${N_CIFS} best-model CIF(s) found"
+
+if [ "${N_BACKBONES}" -eq 0 ]; then
+    echo "[ERROR] No backbone PDBs found in ${BACKBONE_DIR}"
+    exit 1
+fi
+
+if [ "${N_CIFS}" -eq 0 ]; then
+    echo "[ERROR] No CIF files matching '${CIF_FILENAME}' found under ${AF3_DIR}"
+    echo "[ERROR] Check the CIF_FILENAME variable matches your Job2 output filenames"
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# Run RMSD analysis
+# ------------------------------------------------------------
+
+echo ""
+echo "[INFO] Starting RMSD analysis at $(date)"
+echo ""
+
+"${PYTHON_BIN}" "${PYTHON_SCRIPT}" \
+    --backbones     "${BACKBONE_DIR}"   \
+    --af3_dir       "${AF3_DIR}"        \
+    --output        "${OUTPUT_DIR}"     \
+    --threshold     "${RMSD_THRESHOLD}" \
+    --top_n         "${TOP_N}"          \
+    --cif_filename  "${CIF_FILENAME}"  \
+    --af3_summary   "${AF3_SUMMARY}"
+
+EXIT_CODE=$?
+
+# ------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------
+
+echo ""
+echo "========================================================"
+echo "  Analysis complete — $(date)"
+echo "  Exit code : ${EXIT_CODE}"
+echo ""
+
+if [ "${EXIT_CODE}" -eq 0 ]; then
+    echo "  Output files:"
+    echo "    ${OUTPUT_DIR}/all_rmsd_results.csv"
+    echo "    ${OUTPUT_DIR}/promising_hits.csv"
+    echo "    ${OUTPUT_DIR}/rmsd_summary.txt"
+    echo "    ${OUTPUT_DIR}/combined_summary.csv"
+    echo "    ${OUTPUT_DIR}/combined_summary.txt"
+    echo "    ${OUTPUT_DIR}/af3_rmsd_summary.xlsx"
+    echo "    ${OUTPUT_DIR}/per_design/"
+    echo ""
+    echo "-------- RMSD SUMMARY --------"
+    cat "${OUTPUT_DIR}/rmsd_summary.txt"
+else
+    echo "  [ERROR] Analysis failed with exit code ${EXIT_CODE}"
+    echo "  Check: logs/rmsd_analysis_${SLURM_JOB_ID:-local}.err"
+fi
+
+echo "========================================================"
+
+exit "${EXIT_CODE}"
